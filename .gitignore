@@ -1,0 +1,15 @@
+# артефакты инжеста (восстановимы из PDF/URL)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# артефакты внешних инструментов
+.kilo/
