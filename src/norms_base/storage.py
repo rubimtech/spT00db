@@ -229,13 +229,13 @@ class Store:
             cursor = conn.execute(
                 """
                 INSERT INTO chunks (doc_id, ord, kind, clause_id, section, section_title,
-                                    heading, page_start, page_end, text)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    heading, page_start, page_end, text, embed_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doc_id, row["ord"], row["kind"], row["clause_id"], row["section"],
                     row["section_title"], row["heading"], row["page_start"], row["page_end"],
-                    row["text"],
+                    row["text"], row.get("embed_text"),
                 ),
             )
             chunk_id = int(cursor.lastrowid)

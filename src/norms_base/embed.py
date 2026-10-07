@@ -22,7 +22,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .config import BGE_M3_DIR, DIM, MAX_TOKENS
+from .config import BGE_M3_DIR, DIM, EMBED_THREADS, MAX_TOKENS
 
 _WS_LIMIT = 50_000  # обрезка до эмбеддинга: длиннее всё равно не влезет в модель
 
@@ -34,9 +34,10 @@ class Embedder:
     ~8 с на прогрев), поэтому её держат между батчами.
     """
 
-    def __init__(self, model_dir: Path | str | None = None, threads: int = 4) -> None:
+    def __init__(self, model_dir: Path | str | None = None, threads: int | None = None) -> None:
         self.model_dir = Path(model_dir or BGE_M3_DIR)
-        self.threads = int(threads)
+        # 8 потоков: замер 2026-10-07 (4 -> 8 = +25% к скорости на длинных чанках)
+        self.threads = int(threads if threads is not None else EMBED_THREADS)
         self._session = None
         self._tokenizer = None
         self._pad_id = 0

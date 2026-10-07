@@ -10,6 +10,11 @@
 
 Файл считается скачанным только по магии ``%PDF-``: заглушку ошибки
 принимать за PDF нельзя — иначе дальше «конвертируется» мусор.
+
+Челлендж эпизодический (≈1 запрос из 3, замер 2026-10-07): ServicePipe
+отдаёт HTML со скриптом servicepipe.tech, но в ТОМ ЖЕ ответе ставит
+``spid``/``spst`` — поэтому повтор делается в той же сессии (:func:`fetch_pdf`),
+а не в новой.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
 
@@ -43,11 +48,27 @@ class FetchResult:
     from_cache: bool
 
 
-def fetch_pdf(url: str, dest_dir: Path, *, filename: str | None = None, timeout: int = 90) -> FetchResult:
-    """Скачивает PDF в ``dest_dir`` (повторно использует файл, если sha уже есть).
+def fetch_pdf(
+    url: str,
+    dest_dir: Path,
+    *,
+    filename: str | None = None,
+    timeout: int = 90,
+    attempts: int = 5,
+    delay: float = 2.0,
+    verbose: bool = False,
+) -> FetchResult:
+    """Скачивает PDF в ``dest_dir``, проходя антибот-челлендж повтором в ТОЙ ЖЕ сессии.
 
-    Повторный запуск инжеста не качает заново: если каталог уже содержит файл
-    с таким же содержимым, он переиспользуется.
+    Хостинг защищён ServicePipe: примерно в одном запросе из трёх вместо файла
+    приходит HTML-челлендж (1892 байта, скрипт servicepipe.tech). Ключевая
+    деталь — **сам ответ с челлендже выставляет cookies** ``spid``/``spst``,
+    после чего следующий запрос того же инстанса проходит. Поэтому повтор в
+    НОВОЙ сессии бессмыслен: она стартует без этих cookies и получает
+    челлендж снова — ровно эта ошибка и была сделана ранее.
+
+    Файл принимается только по магии ``%PDF-``: заглушку ошибки дальше
+    «конвертировать» нельзя.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     parts = urlsplit(url)
@@ -62,35 +83,63 @@ def fetch_pdf(url: str, dest_dir: Path, *, filename: str | None = None, timeout:
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         }
     )
+    last_error: DownloadError | None = None
     try:
-        # Шаг 1: cookies корневой страницы.
-        session.get(origin, timeout=timeout)
-        # Шаг 2: сам файл с Referer и Sec-Fetch-* как у браузера.
-        response = session.get(
-            url,
-            headers={
-                "Referer": origin,
-                "Accept": "application/pdf,application/xhtml+xml,text/html;q=0.9,*/*;q=0.8",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-origin",
-                "Upgrade-Insecure-Requests": "1",
-            },
-            timeout=timeout,
-        )
+        session.get(origin, timeout=timeout)  # Шаг 1: cookies корневой страницы
+        for attempt in range(1, max(attempts, 1) + 1):
+            # Шаг 2: файл тем же cookie-джаром, с Referer и Sec-Fetch-* как у браузера
+            response = session.get(url, headers=_file_headers(origin), timeout=timeout)
+            body = response.content
+            if response.status_code == 200 and body.startswith(b"%PDF-"):
+                return _store(dest_dir, body, url, parts, filename, response)
+            last_error = _problem(url, response, body)
+            if verbose and attempt < attempts:
+                print(
+                    f"[pdf] попытка {attempt}/{attempts}: {last_error}. "
+                    f"Повтор через {delay * attempt:.0f} с в той же сессии.",
+                    flush=True,
+                )
+            if attempt < attempts:
+                time.sleep(delay * attempt)
     except requests.RequestException as exc:
         raise DownloadError(f"сетевая ошибка при скачивании {url}: {exc}") from exc
 
-    body = response.content
-    if response.status_code != 200:
-        raise DownloadError(f"HTTP {response.status_code} для {url}")
-    if not body.startswith(b"%PDF-"):
-        preview = body[:300].decode("utf-8", errors="replace")
-        raise DownloadError(
-            "сервер отдал не PDF (защита от ботов или редирект на страницу ошибки). "
-            f"Начало ответа: {preview!r}"
-        )
+    raise last_error if last_error else DownloadError(f"не удалось скачать {url}")
 
+
+def _file_headers(origin: str) -> dict[str, str]:
+    return {
+        "Referer": origin,
+        "Accept": "application/pdf,application/xhtml+xml,text/html;q=0.9,*/*;q=0.8",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def _problem(url: str, response: requests.Response, body: bytes) -> DownloadError:
+    if response.status_code != 200:
+        return DownloadError(f"HTTP {response.status_code} для {url}")
+    preview = body[:300].decode("utf-8", errors="replace")
+    # метки ServicePipe живут дальше 300 символов — ищем по первым КБ
+    head = body[:4000].decode("utf-8", errors="replace")
+    if "servicepipe" in head or "js-challenge" in head:
+        return DownloadError("антибот-челлендж ServicePipe вместо PDF")
+    return DownloadError(
+        "сервер отдал не PDF (защита от ботов или редирект на страницу ошибки). "
+        f"Начало ответа: {preview!r}"
+    )
+
+
+def _store(
+    dest_dir: Path,
+    body: bytes,
+    url: str,
+    parts: SplitResult,
+    filename: str | None,
+    response: requests.Response,
+) -> FetchResult:
     digest = hashlib.sha256(body).hexdigest()
     name = filename or _suggest_name(parts.path, digest)
     path = dest_dir / name
