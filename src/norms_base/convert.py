@@ -27,8 +27,15 @@ EDITION_TAIL = re.compile(r"^\(?(?:проект[^()]{0,40}редакция|из�
 #: Номер страницы: арабские (109 стр.) и римские фронтисписа (II…VI).
 PAGE_NUMBER = re.compile(r"^(\d{1,3}|I{1,3}|IV|V|VI)$")
 
-RE_MARKUP = re.compile(r"[#*`<>|]")
-RE_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
+#: Тег pymupdf4llm (``<u>``, ``<br/>``, ``<sup>``): снимаются до сравнения строк,
+#: иначе колонтитул «**(проект 2 редакция)** в тегах» не узнаётся.
+RE_TAG = re.compile(r"</?[a-zA-Z][^>]*>")
+#: Всё, кроме слова, точки, пробела и дефиса: разметка Markdown, скобки и
+#: подчёркивание отметки редакции выпадают из строки, код документа
+#: «СП 60.13330.2020» остаётся. Подчёркивание вычищается отдельно — оно входит
+#: в ``\\w``, поэтому одного отрицания мало: строка вида
+#: ``**СП 60.13330.2020** _(проект 2 редакция)_`` иначе не узнаётся.
+RE_NOT_WORD = re.compile(r"[^\w.\s-]|_", re.UNICODE)
 RE_EDITION_PREFIX = re.compile(
     r"^\s*#{0,3}\s*_?\(?(?:<u>)?проект[^_)\n<]{0,40}редакция\)?(?:</u>)?_?\s*",
     re.IGNORECASE,
@@ -125,9 +132,12 @@ def _is_header_like(line: str, doc_code: str) -> bool:
     Ссылка на норматив внутри предложения («в соответствии со СП 60.13330.2020…»)
     сюда не попадает — там после кода идёт осмысленный текст.
     """
-    bare = RE_MARKUP.sub(" ", RE_BR.sub(" ", line))
+    bare = RE_NOT_WORD.sub(" ", RE_TAG.sub(" ", line))
     bare = re.sub(r"\s+", " ", bare).strip()
     if bare == doc_code:
+        return True
+    if EDITION_TAIL.match(bare):
+        # строка только из отметки редакции (кода документа рядом не было)
         return True
     if bare.startswith(doc_code):
         tail = bare[len(doc_code):].strip()

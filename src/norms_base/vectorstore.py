@@ -39,6 +39,7 @@ def _build_payload_indexes() -> dict[str, Any]:
     return {
         "doc_code": models.PayloadSchemaType.KEYWORD,
         "clause_id": models.PayloadSchemaType.KEYWORD,
+        "clause_ids": models.PayloadSchemaType.KEYWORD,
         "section": models.PayloadSchemaType.KEYWORD,
         "kind": models.PayloadSchemaType.KEYWORD,
         "doc_title": models.PayloadSchemaType.KEYWORD,

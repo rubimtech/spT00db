@@ -21,8 +21,16 @@ from .config import CHUNK_MAX_CHARS, CHUNK_MIN_CHARS
 
 RE_HEADING = re.compile(r"^(#{1,4})\s+(.+?)\s*$")
 RE_APPENDIX = re.compile(r"^\*{0,2}Приложение\s+([А-ПA-Z])\.?\*{0,2}\s*$")
+#: Номер пункта: цифровой («7.6.9», «1 Область применения») — он же граница раздела.
 RE_CLAUSE = re.compile(r"^(\d{1,2}(?:\.\d{1,2}){0,2})\.?\s+\S")
+#: Любой номер пункта, включая пункты приложений («А.1», «Б.2.3», «П.1»):
+#: ссылки на них есть в тексте («п. А.2.4 приложения А»), поэтому такие строки
+#: обязаны быть границей чанка и попадать в поиск по номеру.
+RE_CLAUSE_ANY = re.compile(
+    r"^((?:\d{1,2}(?:\.\d{1,2}){0,2})|(?:[А-П]\.\d{1,2}(?:\.\d{1,2})*))\.?\s+\S"
+)
 RE_TABLE = re.compile(r"^\|")
+RE_TABLE_SEP = re.compile(r"^\|(\s*:?-+:?\s*\|)+\s*$")
 RE_SENTENCE = re.compile(r"(?<=[.!?;])\s+")
 
 
@@ -37,6 +45,9 @@ class Chunk:
     text: str
     start: int
     end: int
+    #: все пункты, попавшие в чанк (склейка мелких пунктов не должна терять
+    #: их номера — иначе «п. 7.6.9» не находится в склеенном чанке 7.6.8)
+    clauses: tuple[str, ...] = ()
 
     @property
     def size(self) -> int:
@@ -53,10 +64,20 @@ class _Block:
     lines: list[str]
     start: int
     end: int
+    clauses: tuple[str, ...] = ()
 
     @property
     def text(self) -> str:
         return "\n".join(self.lines).strip("\n")
+
+    @property
+    def size(self) -> int:
+        """Длина текста блока — та же метрика, что у :attr:`Chunk.size`.
+
+        Свойства нет на ``_Block``, ломается весь чанкер: ``_merge_small`` и
+        ``_oversized`` меряют блоки именно в символах, а не в строках.
+        """
+        return len(self.text)
 
 
 def chunk_markdown(
@@ -78,6 +99,7 @@ def chunk_markdown(
             text=block.text,
             start=block.start,
             end=block.end,
+            clauses=block.clauses,
         )
         for index, block in enumerate(blocks)
     ]
@@ -116,8 +138,10 @@ def _split_blocks(text: str, min_chars: int, max_chars: int) -> list[_Block]:
 
     def flush() -> None:
         nonlocal current
+        # end здесь НЕ пересчитывается: offset уже ушёл за строку-границу
+        # (заголовок или новый пункт), и блок захватывал бы чужую строку —
+        # страница чанка из-за этого уезжала на страницу дальше.
         if current is not None and current.lines:
-            current.end = offset
             blocks.append(current)
         current = None
 
@@ -134,7 +158,14 @@ def _split_blocks(text: str, min_chars: int, max_chars: int) -> list[_Block]:
         heading = _heading_of(stripped)
         if heading is not None:
             flush()
-            section, section_title = _section_of(heading)
+            new_section, new_title = _section_of(heading)
+            if new_section:
+                section, section_title = new_section, new_title
+            else:
+                # Ненумерованный заголовок — подзаголовок текущего раздела, а не
+                # его конец: заголовок приложения «Расчет тепловых нагрузок…»
+                # иначе сбрасывал section в «», и всё приложение теряло привязку.
+                section_title = heading
             pending_heading = heading
             continue
 
@@ -145,9 +176,10 @@ def _split_blocks(text: str, min_chars: int, max_chars: int) -> list[_Block]:
                 current = _new_block("table", line_start, section, section_title, pending_heading)
                 pending_heading = ""
             current.lines.append(raw_line)
+            current.end = offset
             continue
 
-        clause_match = RE_CLAUSE.match(stripped)
+        clause_match = RE_CLAUSE_ANY.match(stripped)
         starts_clause = clause_match is not None
         clause_id = clause_match.group(1) if clause_match else None
         if starts_clause:
@@ -165,7 +197,29 @@ def _split_blocks(text: str, min_chars: int, max_chars: int) -> list[_Block]:
 
     flush()
     merged = [block for block in _merge_small(blocks, min_chars) if block.text]
-    return _oversized(merged, max_chars)
+    return _attach_clauses(_oversized(merged, max_chars))
+
+
+def _attach_clauses(blocks: Sequence[_Block]) -> list[_Block]:
+    """Проставляет блоку все пункты, чьи строки в него вошли (пост-проход).
+
+    Склейка мелких пунктов оставляет в блоке только номер первого, и тогда
+    «п. 7.6.9» не находился бы: пункт жил в чанке, помеченном как 7.6.8.
+    Номера пересчитываются по готовым блокам — так одинаково ведут себя и
+    склейка, и разрезка oversized-блока, и таблицы.
+    """
+    for block in blocks:
+        found: list[str] = []
+        for line in block.lines:
+            match = RE_CLAUSE_ANY.match(line.strip())
+            if match and match.group(1) not in found:
+                found.append(match.group(1))
+        if found:
+            block.clauses = tuple(found)
+            block.clause_id = found[0]
+        else:
+            block.clauses = (block.clause_id,) if block.clause_id else ()
+    return list(blocks)
 
 
 def _new_block(
@@ -197,7 +251,7 @@ def _heading_of(line: str) -> str | None:
     # жирный «заголовок на всю строку» — так pymupdf4llm отдаёт приложения
     if line.startswith("**") and line.endswith("**") and len(line) < 70:
         inner = line.strip("*").strip()
-        if RE_CLAUSE.match(inner) is None and "\n" not in inner:
+        if RE_CLAUSE_ANY.match(inner) is None and "\n" not in inner:
             return inner
     return None
 
@@ -215,13 +269,18 @@ def _section_of(heading: str) -> tuple[str, str]:
 
 
 def _merge_small(blocks: list[_Block], min_chars: int) -> list[_Block]:
-    """Дотягивает мелкие блоки до min_chars: вперёд в пределах раздела, затем назад."""
+    """Дотягивает мелкие блоки до min_chars: вперёд в пределах раздела, затем назад.
+
+    Граница раздела — единственное, что склейка не пересекает: защищать её
+    дополнительно запретом на склейку первого блока после заголовка нельзя —
+    тогда в базу попадают чанки из 4-11 символов («Стр.», «Таблица Б.1»),
+    чьи векторы мусорят выдачу.
+    """
     forward: list[_Block] = []
     for block in blocks:
         if (
             forward
             and block.size < min_chars
-            and not block.heading
             and forward[-1].section == block.section
             and forward[-1].size + block.size <= min_chars * 2
         ):
@@ -230,7 +289,9 @@ def _merge_small(blocks: list[_Block], min_chars: int) -> list[_Block]:
             target.end = block.end
             target.clause_id = target.clause_id or block.clause_id
             if target.kind != block.kind:
-                target.kind = "text" if block.kind == "text" else target.kind
+                # таблица важнее текста: подпись к таблице, склеенная с ней,
+                # должна остаться чанком kind=table, иначе ломается фильтр по таблицам
+                target.kind = "table" if "table" in (target.kind, block.kind) else "text"
             continue
         forward.append(block)
 
@@ -240,7 +301,6 @@ def _merge_small(blocks: list[_Block], min_chars: int) -> list[_Block]:
             backward
             and block.size < min_chars
             and backward[-1].section == block.section
-            and not block.heading
             and backward[-1].size + block.size <= min_chars * 2
         ):
             target = backward[-1]
@@ -253,13 +313,86 @@ def _merge_small(blocks: list[_Block], min_chars: int) -> list[_Block]:
 
 
 def _oversized(blocks: Sequence[_Block], max_chars: int) -> list[_Block]:
-    """Разрезает блоки больше max_chars по абзацам/предложениям (смещения сохраняются)."""
+    """Разрезает блоки больше max_chars (смещения сохраняются).
+
+    Таблицы режутся по СТРОКАМ с повтором шапки в каждой части: строка вне
+    шапки не читается сама по себе, а обрезанный молча хвост уехал бы за
+    MAX_TOKENS модели (таблица на 4939 символов — это уже не 2048 токенов).
+    """
     result: list[_Block] = []
     for block in blocks:
         if block.size <= max_chars:
             result.append(block)
-            continue
-        result.extend(_split_block(block, max_chars))
+        elif block.kind == "table":
+            result.extend(_split_table(block, max_chars))
+        else:
+            result.extend(_split_block(block, max_chars))
+    return result
+
+
+def _split_table(block: _Block, max_chars: int) -> list[_Block]:
+    """Режет таблицу по строкам, повторяя шапку (строки до разделителя ``|---|``) в каждой части.
+
+    Смещения каждой части — позиция её ПЕРВОЙ СТРОКИ ДАННЫХ в исходном блоке:
+    страница считается по данным, а не по повторённой шапке.
+    """
+    lines = block.lines
+    head_end = 0
+    for index, line in enumerate(lines):
+        if RE_TABLE_SEP.match(line.strip()):
+            head_end = index + 1
+            break
+    head_lines = lines[:head_end]
+    head_len = len("\n".join(head_lines))
+    if not head_lines:
+        head_len = 0
+
+    offsets: list[int] = []
+    cursor = 0
+    for line in lines:
+        offsets.append(cursor)
+        cursor += len(line) + 1
+
+    # части: (первая строка данных, последняя строка данных, строки части)
+    groups: list[tuple[int, int, list[str]]] = []
+    current: list[str] = list(head_lines)
+    current_len = head_len
+    first_data: int | None = None
+    last_data = head_end
+    for index in range(head_end, len(lines)):
+        line = lines[index]
+        extra = len(line) + (1 if current_len else 0)
+        # резать можно только когда в текущей части уже есть строки данных —
+        # иначе получится пустая часть из одной шапки
+        if current_len + extra > max_chars and len(current) > head_end:
+            groups.append((first_data if first_data is not None else head_end, last_data, current))
+            current = list(head_lines) + [line]
+            current_len = len("\n".join(current))
+            first_data = index
+        else:
+            if first_data is None:
+                first_data = index
+            current.append(line)
+            current_len += extra
+        last_data = index
+    groups.append((first_data if first_data is not None else head_end, last_data, current))
+
+    result: list[_Block] = []
+    for start_index, end_index, piece_lines in groups:
+        start = block.start + offsets[min(start_index, len(offsets) - 1)]
+        end = block.start + offsets[min(end_index, len(offsets) - 1)] + len(lines[end_index])
+        result.append(
+            _Block(
+                kind="table",
+                clause_id=block.clause_id,
+                section=block.section,
+                section_title=block.section_title,
+                heading=block.heading if start_index <= head_end else "",
+                lines=piece_lines,
+                start=start,
+                end=end,
+            )
+        )
     return result
 
 

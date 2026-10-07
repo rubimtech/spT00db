@@ -42,6 +42,8 @@ class Hit:
     page_end: int | None
     text: str
     score: float
+    #: все пункты чанка: склейка мелких пунктов кладёт 7.6.8 и 7.6.9 в один чанк
+    clause_ids: tuple[str, ...] = ()
     sources: list[str] = field(default_factory=list)
 
     @classmethod
@@ -58,6 +60,7 @@ class Hit:
             page_end=row.page_end,
             text=row.text,
             score=score,
+            clause_ids=row.clause_ids,
             sources=sources,
         )
 
@@ -68,6 +71,7 @@ class Hit:
             "doc_code": self.doc_code,
             "doc_title": self.doc_title,
             "clause_id": self.clause_id,
+            "clause_ids": list(self.clause_ids),
             "section": self.section,
             "section_title": self.section_title,
             "heading": self.heading,
@@ -100,11 +104,20 @@ def _open(store: Store | None) -> tuple[Store, bool]:
 
 
 def clause(doc_code: str, clause_id: str, *, store: Store | None = None) -> list[Hit]:
-    """Точный пункт: ``clause('СП 60.13330.2020', '7.6.9')``."""
+    """Точный пункт: ``clause('СП 60.13330.2020', '7.6.9')``.
+
+    Чанк может нести несколько пунктов (склейка мелких), поэтому в выдаче
+    ``clause_id`` — запрошенный номер (корректная ссылка в цитате), а соседние
+    пункты того же чанка перечислены в ``clause_ids``.
+    """
     opened, own = _open(store)
     try:
         rows = opened.find_clause(doc_code, clause_id)
-        return [Hit.from_row(row, score=1.0, sources=["exact"]) for row in rows]
+        hits = [Hit.from_row(row, score=1.0, sources=["exact"]) for row in rows]
+        for hit in hits:
+            if clause_id in hit.clause_ids:
+                hit.clause_id = clause_id
+        return hits
     finally:
         if own:
             opened.close()
@@ -168,6 +181,7 @@ def semantic(
                         doc_code=str(payload.get("doc_code", "")),
                         doc_title=str(payload.get("doc_title", "")),
                         clause_id=payload.get("clause_id"),
+                        clause_ids=tuple(str(item) for item in (payload.get("clause_ids") or ())),
                         section=payload.get("section"),
                         section_title=payload.get("section_title"),
                         heading=payload.get("heading"),

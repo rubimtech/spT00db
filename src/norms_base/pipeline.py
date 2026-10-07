@@ -25,7 +25,7 @@ from .config import MD_DIR, PDF_DIR, ensure_dirs
 from .convert import pdf_to_markdown
 from .download import fetch_pdf
 from .embed import Embedder
-from .storage import Store
+from .storage import Store, parse_clause_ids
 from .vectorstore import VectorStore, point_id_for
 
 
@@ -94,6 +94,7 @@ def add_document(
             "ord": chunk.ord,
             "kind": chunk.kind,
             "clause_id": chunk.clause_id,
+            "clause_ids": list(chunk.clauses),
             "section": chunk.section,
             "section_title": chunk.section_title,
             "heading": chunk.heading,
@@ -104,8 +105,13 @@ def add_document(
         for chunk in chunks
     ]
     if verbose:
-        clauses = len({row["clause_id"] for row in rows if row["clause_id"]})
-        print(f"[chunk] {len(rows)} чанков, {clauses} уникальных пунктов", flush=True)
+        clauses = {cid for row in rows for cid in row["clause_ids"]}
+        shared = sum(1 for row in rows if len(row["clause_ids"]) > 1)
+        print(
+            f"[chunk] {len(rows)} чанков, {len(clauses)} уникальных пунктов "
+            f"({shared} чанков несут больше одного пункта)",
+            flush=True,
+        )
 
     # 4. SQLite
     existed = store.get_document(code) is not None
@@ -152,6 +158,7 @@ def add_document(
                     "doc_code": code,
                     "doc_title": title,
                     "clause_id": row["clause_id"],
+                    "clause_ids": parse_clause_ids(row["clause_ids"]),
                     "section": row["section"],
                     "section_title": row["section_title"],
                     "heading": row["heading"],
@@ -236,6 +243,7 @@ def reembed_pending(
                     "doc_code": doc_code,
                     "doc_title": doc_title,
                     "clause_id": row["clause_id"],
+                    "clause_ids": parse_clause_ids(row["clause_ids"]),
                     "section": row["section"],
                     "section_title": row["section_title"],
                     "heading": row["heading"],
