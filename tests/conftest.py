@@ -122,6 +122,42 @@ def build_fixture_pdf(path: Path) -> Path:
         if index >= 2:
             _draw_table(page, y, table_rows[index - 2])
 
+    # Формула для тестов formulas: дробь (числитель, черта, знаменатель) +
+    # отдельная строка-номер (А.6) справа — детекция в СП 60 ловит по тегу
+    # и по чертежу, фикстура повторяет оба сигнала.
+    page3 = doc[2]
+    page3.insert_textbox(
+        pymupdf.Rect(56, 616, 200, 638), "353",
+        fontname="arial", fontsize=10, fontfile=str(FONT),
+    )
+    page3.draw_line(pymupdf.Point(56, 642), pymupdf.Point(150, 642), width=1)
+    page3.insert_textbox(
+        pymupdf.Rect(56, 644, 300, 666), "273 + tн, кг/м3",
+        fontname="arial", fontsize=10, fontfile=str(FONT),
+    )
+    page3.insert_text((470, 662), "(А.6)", fontname="arial", fontsize=9, fontfile=str(FONT))
+
+    # Картинки для тестов figures: векторная схема с подписью (стр. 1, crop)
+    # и растровая вставка с подписью (стр. 4, raster). Подпись в конце
+    # страницы заканчивается точкой — иначе склейка страниц ломает проверку
+    # рваного абзаца в test_convert_joins_torn_paragraph.
+    page1 = doc[0]
+    page1.draw_rect(pymupdf.Rect(50, 640, 300, 730), color=(0, 0, 0), width=1)
+    page1.draw_line(pymupdf.Point(50, 730), pymupdf.Point(300, 640), width=1)
+    page1.insert_text(
+        (50, 760), "Рисунок 1 - Кривая охлаждения теплоносителя.",
+        fontname="arial", fontsize=9, fontfile=str(FONT),
+    )
+
+    page4 = doc[3]
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 80))
+    pix.samples_mv[:] = bytes((180, 200, 220)) * (120 * 80)
+    page4.insert_image(pymupdf.Rect(50, 350, 170, 430), pixmap=pix)
+    page4.insert_text(
+        (50, 450), "Рисунок 2 - Схема испытания системы отопления.",
+        fontname="arial", fontsize=9, fontfile=str(FONT),
+    )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(path))
     doc.close()
@@ -189,6 +225,7 @@ def ingested(tmp_path_factory: pytest.TempPathFactory):
         patch.setattr(module, "DATA_DIR", work, raising=False)
         patch.setattr(module, "PDF_DIR", work / "pdf", raising=False)
         patch.setattr(module, "MD_DIR", work / "md", raising=False)
+        patch.setattr(module, "IMG_DIR", work / "img", raising=False)
 
     store = Store(work / "test_normbase.db")
     store.init_schema()

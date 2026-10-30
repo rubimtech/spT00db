@@ -25,7 +25,10 @@ from .config import EMBED_BATCH, MD_DIR, PDF_DIR, ensure_dirs
 from .convert import pdf_to_markdown
 from .download import fetch_pdf
 from .embed import Embedder
+from .figures import sync_figures
+from .formulas import sync_formulas
 from .storage import Store, parse_clause_ids
+from .tables import sync_tables
 from .vectorstore import VectorStore, point_id_for
 
 
@@ -40,6 +43,9 @@ class AddResult:
     seconds: float
     md_path: Path
     pdf_path: Path
+    figures: int = 0
+    tables: int = 0
+    formulas: int = 0
 
 
 def add_document(
@@ -134,6 +140,15 @@ def add_document(
     )
     store.replace_chunks(doc_id, code, rows)
 
+    # 4b. Картинки PDF: вырезаем в data/img; описания прошлой индексации
+    # вшиваем обратно в чанки — replace_chunks их вырезал
+    figure_count = sync_figures(store, doc_id, fetched_path, code, verbose=verbose)
+
+    # 4c. Структурированные таблицы (ячейки с числами) и формулы (кропы):
+    # расчётно-проверочные скрипты берут значения отсюда, а не из текста чанка
+    table_count = sync_tables(store, doc_id, code, doc.text, doc.page_for, verbose=verbose)
+    formula_count = sync_formulas(store, doc_id, fetched_path, code, verbose=verbose)
+
     # 5. Векторы: старые точки документа убираем, новые эмбедим и грузим
     if not vector_store.available():
         vector_store.ensure_collection()
@@ -161,6 +176,9 @@ def add_document(
         seconds=time.perf_counter() - started,
         md_path=md_path,
         pdf_path=fetched_path,
+        figures=figure_count,
+        tables=table_count,
+        formulas=formula_count,
     )
     if verbose:
         print(

@@ -1,0 +1,246 @@
+# Vision-бенчмарк routerai — 20 моделей × 4 теста (2026-10-30)
+
+Сравнение vision-моделей шлюза routerai для задач базы нормдокументов
+(`figures --auto` / `formulas --auto`): качество против зафиксированного
+эталона, скорость, токены, стоимость.
+
+## Методика
+
+По скиллу `llm-model-benchmark`:
+
+- **Входы заморожены**: одни и те же байты картинок (кроп 1280 px, base64),
+  один и тот же промпт, `max_tokens` 4000 → 8000, `temperature 0.1` для всех
+  моделей (кроме `scaledown` — у него параметра нет в `supported_parameters`).
+- **Эталон (GT) записан ДО запусков** — по нему считается скоринг.
+- **Прод-петля ретраев**: невалидный JSON / пустой content → повтор с двойным
+  `max_tokens` (как в `describe_formula_with_llm`); 400 из-за `temperature` →
+  поле убирается.
+- **Стоимость** = сумма `usage` ВСЕХ попыток (ретраи оплачиваются) × прайс
+  каталога routerai (`get_model`, `pricing.prompt/completion` за токен).
+  Пересчёт одной строки вручную сходится (0.0559 ₽ luna|captcha).
+- Чекпоинт после каждой пары; упрямые ошибки — максимум 3 прогона.
+- Итог: **80 пар, 74 ok, суммарный расход 110.72 ₽**.
+
+## Тесты и эталоны
+
+| # | Тест | Вход | Эталон (GT) |
+|---|---|---|---|
+| T1 | `formula_a1` | кроп формулы А.1 СП 60 (`f_p076_01.png`), прод-промпт `FORMULA_PROMPT` | `Q_с.овр = Σ_n(Q_тр+Q_вент+Q_инф+Q_мтс) − Q_быт`; индексы: тр, вент, инф, мтс, быт |
+| T2 | `captcha` | искажённая волновая надпись с шумом (`…image_2b0710.png`) | «нижняя подложку» |
+| T3 | `formulas` | страница «Расчет воздухообменных систем» (`…image_ff386c.png`) | 2 формулы: L от M делением на разность концентраций; L от Q_я делением на разность температур; расшифровки «где» |
+| T4 | `node` | узел монтажа окна с красной обводкой (`…image_c81e93.png`) | обведена опорная скоба (сталь ≥4 мм, ширина 40 мм); объяснение для монтажников: состав узла, шаги, внимание к скобе |
+
+Уровни скоринга: **2** = точно по GT, **1** = структура верна, **0** = слабо,
+**X** = не прошёл (пусто/не JSON/ошибка).
+
+## Сводная таблица
+
+| Модель | T1 | T2 | T3 | T4 | Итог | ₽ за 4 теста | Сек сумм |
+|---|---|---|---|---|---|---|---|
+| **google/gemini-3.8-flash** | 2 | 1 | 2 | 2 | **7/8** | **2.65** | 51.2 |
+| **google/gemini-4-argon** | 2 | 1 | 2 | 2 | **7/8** | 2.71 | 43.2 |
+| anthropic/claude-sonnet-5.5 | 2 | 1 | 2 | 2 | 7/8 | 7.92 | 99.2 |
+| google/gemini-nano-banana-2.1 | 2 | 1 | 2 | 2 | 7/8 | 10.01 | 52.9 |
+| x-ai/grok-4.7 | 2 | 1 | 2 | 2 | 7/8 | 10.59 | 192.5 |
+| anthropic/claude-opus-5.5 | 2 | 1 | 2 | 2 | 7/8 | 13.26 | 72.2 |
+| google/gemini-3.1-flash-lite-preview | 1 | 1 | 2 | 2 | 6/8 | 0.30 | 9.3 |
+| openai/gpt-6-luna | 2 | 0 | 2 | 2 | 6/8 | 0.32 | 92.3 |
+| anthropic/claude-haiku-5.5 | 1 | 1 | 2 | 2 | 6/8 | 0.33 | 34.7 |
+| deepseek/deepseek-v4.1-flash-1017 | 2 | 1 | 2 | 1 | 6/8 | 0.34 | 120.6 |
+| qwen/qwen3.8-omni-flash | 1 | 1 | 2 | 2 | 6/8 | 1.63 | 454.1 |
+| meta/muse-spark-open | 1 | 1 | 2 | 2 | 6/8 | 3.65 | 64.7 |
+| meta/muse-wonder | 1 | 1 | 2 | 2 | 6/8 | 19.40 | 78.1 |
+| qwen/qwen3.8-max-prime | 1 | 1 | 2 | 2 | 6/8 | 32.51 | 349.9 |
+| z-ai/glm-5.3-flash \* | 1 | 0 | 2 | 2 | 5/8 | 0.03 | 40.4 |
+| xiaomi/mimo-v2.6-flash | 1 | 0 | 2 | 2 | 5/8 | 0.11 | 103.9 |
+| nvidia/nemotron-3.5-super-vl | 1 | 1 | 2 | 1 | 5/8 | 0.43 | 99.4 |
+| unbiased/pareto-26.10 | 1 | 0 | 2 | 2 | 5/8 | 3.60 | 43.7 |
+| minimax/minimax-m3.1-flash \*\* | X | 0 | 2 | X | 2/8 | 0.92 | 439.1 |
+| scaledown/extract \*\*\* | X | X | X | X | 0/8 | 0.00 | 7.5 |
+
+\* glm — только с `reasoning_effort: low`: штатно обе попытки (4000/8000) возвращают пустой content (reasoning съедает бюджет).
+\*\* minimax — та же проблема штатно; **с `reasoning_effort: low` проходит оба провала** (T1: 0.076 ₽, T4: 0.048 ₽) — с правкой payload было бы 5/8.
+\*\*\* scaledown — не поломка: свой контракт, требует `response_format: json_schema` с entities («extract requires a response_format of type json_schema…»). Это целевая extraction-модель, к произвольным vision-промптов неприменима без отдельной интеграции.
+
+## Наблюдения по тестам
+
+### T1 — формула А.1 (самый дискриминаторный)
+
+Точно по GT (4–5 индексов из 5 + структура суммы): `gemini-4-argon`,
+`claude-sonnet-5.5`, `claude-opus-5.5`, `grok-4.7`, `nano-banana-2.1`,
+`gemini-3.8-flash`, `gpt-6-luna` (4/5), `deepseek-v4.1-flash-1017` (4/5).
+Не прочитали индексы вовсе при верной структуре: `nemotron-3.5-super-vl`,
+`qwen3.8-max-prime` (13 ₽ за тест — худшее соотношение), `gemini-3.1-flash-lite`.
+
+### T2 — капча (тест не прошёл никто точно)
+
+12 из 20 читают «нижняя **похожую**», 2 — «положую» (ближе к GT «подложку»);
+слово «нижняя» читают почти все. Галлюцинации: `gpt-6-luna` — «Жизнь полна
+чудес», `minimax` — «Инструкция по охране труда», `glm/mimo/pareto` — мусор.
+**Вывод**: для волново-искажённой надписи единый точный GT без автора
+изображения непоставим — тест измеряет только первую половину.
+
+### T3 — две формулы воздухообмена (лёгкий)
+
+19/20 exact — все модели, кроме `scaledown`, нашли обе формулы с делением и
+темами. Дискриминаторной силы не имеет; годится как smoke.
+
+### T4 — узел крепления для монтажников
+
+17/20 exact: назвали обведённый элемент (в т.ч. синонимами «опорная/анкерная
+пластина» при параметрах 4 мм и 40 мм), дали шаги и состав узла. Хуже всех:
+`nemotron` и `deepseek-v4.1-flash-1017` — элемент не выделили.
+Пример эталонного ответа — `gemini-3.8-flash`: «Ключевой несущий элемент
+(обведён красным): опорная анкерная пластина — сталь, толщина 4 мм,
+ширина 40 мм».
+
+### Прочие находки
+
+- `qwen3.8-omni-flash`: аномальный `usage` (28 050 выходных токенов в одном
+  запросе T1) и латентность 390 с — учёт/бюджет reasoning вызывает вопросы.
+- Стоимость различается в ~1000 раз между моделями (0.003 ₽ у glm за капчу
+  против 15 ₽ за запрос у qwen-max-prime) — цена каталога не коррелирует с
+  качеством на этой задаче.
+- Тесты T1/T4 дискриминируют модели, T3 — нет.
+
+## Рекомендация
+
+- **Максимум качества/цены: `google/gemini-3.8-flash`** — 7/8 как opus/sonnet
+  и grok, но за 2.65 ₽ на весь набор (в 3–5 раз дешевле). Запасной —
+  `google/gemini-4-argon` (7/8, 2.71 ₽).
+- **Для дешёвого прод-описания формул** (текущий `figures.yaml`): остаются
+  `openai/gpt-6-luna` (6/8, 0.32 ₽) и `deepseek-v4.1-flash-1017` (6/8,
+  0.34 ₽); приоритет чтения индексов — у последнего.
+- **Скорость**: `gemini-3.1-flash-lite` (1–3 с), `claude-haiku-5.5`,
+  `gemini-4-argon` (единицы секунд на запрос).
+- При выборе `z-ai/glm-5.3-flash` или `minimax-m3.1-flash` в
+  `describe_formula_with_llm` обязателен параметр `reasoning_effort: low`.
+- `scaledown/extract` в текущий пайплайн не брать (другой API-контракт).
+
+## Сырые данные и воспроизведение
+
+- Ответы, токены, латентности: `vision_bench3.json` (scratch агента),
+  генератор отчёта: `vision_report.py`, бенчмарк: `vision_bench3.py`,
+  добивки: `glm_fix.py`, `bench_fix.py` (там же).
+- Прайсы — MCP `routerai get_model` (₽ за токен, ×10⁶ = ₽/1M).
+
+## Приложение: полный отчёт генератора (скоринг по уровням)
+
+```
+====================================================================================================
+СВОДНАЯ ТАБЛИЦА (2 = точно по GT, 1 = структура верна, 0 = слабо, X = не прошёл)
+модель                                 A1 CAP  FML NODE  итог    ₽ сумм сек сумм
+google/gemini-3.8-flash                 2   1    2    2   7/8     2.653     51.2
+google/gemini-4-argon                   2   1    2    2   7/8     2.708     43.2
+anthropic/claude-sonnet-5.5             2   1    2    2   7/8     7.923     99.2
+google/gemini-nano-banana-2.1           2   1    2    2   7/8    10.011     52.9
+x-ai/grok-4.7                           2   1    2    2   7/8    10.589    192.5
+anthropic/claude-opus-5.5               2   1    2    2   7/8    13.258     72.2
+google/gemini-3.1-flash-lite-preview    1   1    2    2   6/8     0.301      9.3
+openai/gpt-6-luna                       2   0    2    2   6/8     0.319     92.3
+anthropic/claude-haiku-5.5              1   1    2    2   6/8     0.326     34.7
+deepseek/deepseek-v4.1-flash-1017       2   1    2    1   6/8     0.340    120.6
+qwen/qwen3.8-omni-flash                 1   1    2    2   6/8     1.631    454.1
+meta/muse-spark-open                    1   1    2    2   6/8     3.651     64.7
+meta/muse-wonder                        1   1    2    2   6/8    19.401     78.1
+qwen/qwen3.8-max-prime                  1   1    2    2   6/8    32.513    349.9
+z-ai/glm-5.3-flash                      1   0    2    2   5/8     0.030     40.4
+xiaomi/mimo-v2.6-flash                  1   0    2    2   5/8     0.111    103.9
+nvidia/nemotron-3.5-super-vl            1   1    2    1   5/8     0.434     99.4
+unbiased/pareto-26.10                   1   0    2    2   5/8     3.599     43.7
+minimax/minimax-m3.1-flash              X   0    2    X   2/8     0.924    439.1
+scaledown/extract                       X   X    X    X   0/8     0.000      7.5
+
+====================================================================================================
+ДЕТАЛИЗАЦИЯ ПО ТЕСТАМ (отсортировано по стоимости запроса)
+
+--- formula_a1 ---
+  scaledown/extract                     fail      0.8s in=0     out=0        0.0000₽ retry 4000: out=None len=0 ok=False | 8000: out=None len=0 ok=False
+  z-ai/glm-5.3-flash                    struct    7.2s in=322   out=359      0.0048₽      индексы 2/5 (вент+инф)
+  xiaomi/mimo-v2.6-flash                struct   18.4s in=340   out=712      0.0220₽      индексы 1/5 (инф)
+  google/gemini-3.1-flash-lite-preview  struct    1.6s in=1257  out=319      0.0831₽      индексы 0/5 (нет)
+  openai/gpt-6-luna                     exact    19.1s in=310   out=1587     0.0865₽      индексы 4/5, структура суммы
+  anthropic/claude-haiku-5.5            struct    8.5s in=433   out=1708     0.0941₽      индексы 3/5 (вент+инф+быт)
+  deepseek/deepseek-v4.1-flash-1017     exact    72.0s in=896   out=11268    0.2054₽ retry индексы 4/5, структура суммы
+  nvidia/nemotron-3.5-super-vl          struct   78.0s in=1138  out=7111     0.2682₽ retry индексы 0/5 (нет)
+  minimax/minimax-m3.1-flash            fail    153.9s in=1748  out=12000    0.3131₽ retry 4000: out=4000 len=0 ok=False | 8000: out=8000 len=0 ok=False
+  google/gemini-3.8-flash               exact     7.8s in=1256  out=1044     0.5094₽      индексы 4/5, структура суммы
+  google/gemini-4-argon                 exact    10.3s in=1291  out=380      0.6693₽      индексы 5/5, структура суммы
+  meta/muse-spark-open                  struct    8.0s in=413   out=2583     1.2055₽      индексы 3/5 (тр+инф+быт)
+  anthropic/claude-sonnet-5.5           exact    10.5s in=433   out=1086     1.2298₽      индексы 5/5, структура суммы
+  qwen/qwen3.8-omni-flash               struct  389.9s in=337   out=28050    1.3880₽      индексы 2/5 (вент+быт)
+  unbiased/pareto-26.10                 struct   16.2s in=716   out=4326     1.5119₽      индексы 2/5 (тр+инф)
+  anthropic/claude-opus-5.5             exact    10.5s in=433   out=1060     2.4051₽      индексы 5/5, структура суммы
+  x-ai/grok-4.7                         exact    42.8s in=1556  out=3439     2.4905₽      индексы 5/5, структура суммы
+  google/gemini-nano-banana-2.1         exact    15.2s in=1333  out=3554     3.0053₽      индексы 5/5, структура суммы
+  meta/muse-wonder                      struct   18.9s in=293   out=2469     5.3018₽      индексы 3/5 (вент+инф+быт)
+  qwen/qwen3.8-max-prime                struct  127.3s in=646   out=10261    13.1850₽ retry индексы 0/5 (нет)
+
+--- captcha ---
+  scaledown/extract                     fail      1.4s in=0     out=0        0.0000₽ retry 4000: out=None len=0 ok=False | 8000: out=None len=0 ok=False
+  z-ai/glm-5.3-flash                    weak      8.7s in=182   out=269      0.0032₽      «нижкиня похожкую»
+  qwen/qwen3.8-omni-flash               struct    3.0s in=198   out=107      0.0084₽      «нижняя похожую» — слово одно
+  xiaomi/mimo-v2.6-flash                weak      9.6s in=173   out=367      0.0113₽      «книжную дорожку»
+  deepseek/deepseek-v4.1-flash-1017     struct    5.4s in=320   out=532      0.0129₽      «нижняя половина» — слово одно
+  anthropic/claude-haiku-5.5            struct    6.5s in=216   out=392      0.0228₽      «нижняя положую» — слово одно
+  nvidia/nemotron-3.5-super-vl          struct   13.3s in=391   out=672      0.0271₽      «Нижняя похожую» — слово одно
+  google/gemini-3.1-flash-lite-preview  struct    1.1s in=1188  out=11       0.0329₽      «нижняя положую» — слово одно
+  openai/gpt-6-luna                     weak     10.5s in=176   out=1031     0.0559₽      «Жизнь полна чудес»
+  anthropic/claude-opus-5.5             struct    7.0s in=175   out=52       0.1825₽      «нижняя похожую» — слово одно
+  unbiased/pareto-26.10                 weak      3.9s in=177   out=544      0.1974₽      «нижнюю похожую»
+  minimax/minimax-m3.1-flash            weak     89.8s in=750   out=7950     0.2048₽ retry «Инструкция по охране труда»
+  google/gemini-4-argon                 struct    3.4s in=1222  out=15       0.2721₽      «нижняя похожую» — слово одно
+  anthropic/claude-sonnet-5.5           struct   10.0s in=391   out=209      0.3012₽ retry «нижняя похожую» — слово одно
+  google/gemini-3.8-flash               struct   12.1s in=1188  out=677      0.3597₽      «нижняя похожую» — слово одно
+  meta/muse-spark-open                  struct    8.5s in=286   out=729      0.3624₽      «нижняя похожую» — слово одно
+  x-ai/grok-4.7                         struct    3.6s in=1427  out=175      0.4094₽      «нижняя похожую» — слово одно
+  google/gemini-nano-banana-2.1         struct    6.4s in=1208  out=1133     1.0812₽      «нижняя похожую» — слово одно
+  qwen/qwen3.8-max-prime                struct   17.9s in=183   out=1015     1.3542₽      «нижняя похожую» — слово одно
+  meta/muse-wonder                      struct   23.0s in=168   out=2083     4.4397₽      «нижняя похожую» — слово одно
+
+--- formulas ---
+  scaledown/extract                     fail      3.8s in=0     out=0        0.0000₽ retry 4000: out=None len=0 ok=False | 8000: out=None len=0 ok=False
+  z-ai/glm-5.3-flash                    exact     8.5s in=1137  out=498      0.0106₽      2 формулы, обе темы, деление есть
+  nvidia/nemotron-3.5-super-vl          exact     2.2s in=914   out=495      0.0239₽      2 формулы, обе темы, деление есть
+  xiaomi/mimo-v2.6-flash                exact    12.1s in=918   out=930      0.0347₽      2 формулы, обе темы, деление есть
+  deepseek/deepseek-v4.1-flash-1017     exact    16.9s in=651   out=2860     0.0571₽      2 формулы, обе темы, деление есть
+  openai/gpt-6-luna                     exact    11.7s in=1054  out=1031     0.0651₽      2 формулы, обе темы, деление есть
+  qwen/qwen3.8-omni-flash               exact    21.7s in=935   out=1106     0.0692₽      2 формулы, обе темы, деление есть
+  anthropic/claude-haiku-5.5            exact     8.1s in=1213  out=1459     0.0892₽      2 формулы, обе темы, деление есть
+  minimax/minimax-m3.1-flash            exact    19.7s in=1363  out=3332     0.0924₽      2 формулы, обе темы, деление есть
+  google/gemini-3.1-flash-lite-preview  exact     3.9s in=1176  out=432      0.0988₽      2 формулы, обе темы, деление есть
+  unbiased/pareto-26.10                 exact     8.0s in=1161  out=1556     0.6196₽      2 формулы, обе темы, деление есть
+  google/gemini-4-argon                 exact    12.5s in=1212  out=468      0.7451₽      2 формулы, обе темы, деление есть
+  google/gemini-3.8-flash               exact    14.8s in=1175  out=1858     0.8232₽      2 формулы, обе темы, деление есть
+  meta/muse-spark-open                  exact     6.3s in=1220  out=1787     0.9565₽      2 формулы, обе темы, деление есть
+  anthropic/claude-sonnet-5.5           exact    31.8s in=2424  out=1457     2.0365₽ retry 2 формулы, обе темы, деление есть
+  anthropic/claude-opus-5.5             exact    10.9s in=1213  out=745      2.0716₽      2 формулы, обе темы, деление есть
+  qwen/qwen3.8-max-prime                exact    37.7s in=897   out=1925     2.7990₽      2 формулы, обе темы, деление есть
+  google/gemini-nano-banana-2.1         exact    14.6s in=1232  out=3693     3.0987₽      2 формулы, обе темы, деление есть
+  meta/muse-wonder                      exact    12.3s in=1102  out=1706     4.0408₽      2 формулы, обе темы, деление есть
+  x-ai/grok-4.7                         exact    97.8s in=2161  out=7673     5.2817₽      2 формулы, обе темы, деление есть
+
+--- node ---
+  scaledown/extract                     fail      1.5s in=0     out=0        0.0000₽ retry 4000: out=None len=0 ok=False | 8000: out=None len=0 ok=False
+  z-ai/glm-5.3-flash                    exact    16.0s in=692   out=953      0.0117₽      обведённый элемент назван, шаги, элементов: 3
+  xiaomi/mimo-v2.6-flash                exact    63.8s in=585   out=1441     0.0433₽ retry обведённый элемент назван, шаги, элементов: 4
+  deepseek/deepseek-v4.1-flash-1017     struct   26.3s in=448   out=3414     0.0643₽      элемент:1 обвед:1 шаги:1 элем:1
+  google/gemini-3.1-flash-lite-preview  exact     2.7s in=1202  out=347      0.0861₽      обведённый элемент назван, шаги, элементов: 4
+  openai/gpt-6-luna                     exact    51.0s in=656   out=1997     0.1116₽ retry обведённый элемент назван, шаги, элементов: 4
+  nvidia/nemotron-3.5-super-vl          struct    5.9s in=603   out=3016     0.1145₽      элемент:1 обвед:1 шаги:1 элем:0
+  anthropic/claude-haiku-5.5            exact    11.6s in=763   out=2138     0.1201₽      обведённый элемент назван, шаги, элементов: 4
+  qwen/qwen3.8-omni-flash               exact    39.5s in=588   out=3173     0.1657₽      обведённый элемент назван, шаги, элементов: 4
+  minimax/minimax-m3.1-flash            fail    175.7s in=1824  out=12000    0.3135₽ retry 4000: out=4000 len=0 ok=False | 8000: out=8000 len=0 ok=False
+  google/gemini-3.8-flash               exact    16.5s in=1201  out=2203     0.9609₽      обведённый элемент назван, шаги, элементов: 4
+  google/gemini-4-argon                 exact    17.0s in=1230  out=728      1.0215₽      обведённый элемент назван, шаги, элементов: 4
+  meta/muse-spark-open                  exact    41.9s in=821   out=2287     1.1270₽      обведённый элемент назван, шаги, элементов: 4
+  unbiased/pareto-26.10                 exact    15.6s in=701   out=3609     1.2700₽      обведённый элемент назван, шаги, элементов: 4
+  x-ai/grok-4.7                         exact    48.3s in=1841  out=3212     2.4074₽      обведённый элемент назван, шаги, элементов: 4
+  google/gemini-nano-banana-2.1         exact    16.7s in=1249  out=3343     2.8261₽      обведённый элемент назван, шаги, элементов: 4
+  anthropic/claude-sonnet-5.5           exact    46.9s in=763   out=4000     4.3552₽      обведённый элемент назван, шаги, элементов: 4
+  meta/muse-wonder                      exact    23.9s in=703   out=2538     5.6186₽      обведённый элемент назван, шаги, элементов: 4
+  anthropic/claude-opus-5.5             exact    43.8s in=763   out=3947     8.5992₽      обведённый элемент назван, шаги, элементов: 4
+  qwen/qwen3.8-max-prime                exact   167.0s in=1100  out=11691    15.1751₽ retry обведённый элемент назван, шаги, элементов: 2
+
+проверка пересчёта (luna|captcha): 0.0559 vs 0.0559
+```

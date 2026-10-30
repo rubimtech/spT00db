@@ -1,0 +1,38 @@
+# Описания картинок и формул из PDF (norms.py figures/describe, formulas --auto).
+#
+# Два режима работы:
+#   vision.model ЗАДАНА — norms.py figures --auto / formulas --auto шлёт
+#     pending-объекты во внешнюю LLM (OpenAI-совместимый API);
+#   vision.model пустая — режим агента: norms.py ... --pending печатает
+#     пути к файлам, агент смотрит и заносит описания сам.
+#
+# Провайдер и ключ — откуда брать:
+#   provider/base_url/api_key/api_key_env ПУСТЫЕ = «из Hermes config.yaml»
+#   (провайдер auxiliary.vision, base_url провайдера, ключ из env key_env);
+#   заданные в yaml = «взять отсюда», без обращения к Hermes.
+#   Приоритет ключа: env NORMS_VISION_API_KEY > api_key из yaml >
+#   env(api_key_env) > key_env провайдера из Hermes.
+# Модель переключается строкой vision.model (тесты подряд) или разово:
+#   NORMS_VISION_MODEL=... norms.py formulas --auto --limit 1
+#
+# Проверенные модели (тест 2026-10-29, формула А.1 СП 60):
+# - routerai + openai/gpt-6-luna: РАБОТАЕТ (auto:1, latex/expr/params/text
+#   получены, max_dim 1280). Нюанс: в индексах символов возможны прочтения
+#   «как видно» (Q_мп вместо Q_тр) — сверять по кропу.
+# - plusvibeapi + deepseek-v4.1-flash-1017: РАБОТАЕТ (auto:1, latex/expr/
+#   params/text получены при max_dim 256 — шлюз не рвёт; требует provider:
+#   "plusvibeapi" в этом файле, т.к. имя есть только там).
+# - routerai + deepseek/deepseek-v4.1-flash: работало ранее, 1280 px, подписи
+#   сверены с OCR; «deepseek-v4.1-flash-1017» на routerai НЕТ (400), эквивалент
+#   — deepseek/deepseek-v4.1-flash.
+# - routerai + qwen/qwen3-vl-235b-a22b-instruct: альтернатива, 1280 px.
+vision:
+  provider: "routerai"      # явно: auxiliary.vision в Hermes сейчас "auto" (автовыбор),
+                            # для прямых API не резолвится; ключ всё равно из Hermes (key_env routerai)
+  base_url: ""              # пусто = base_url провайдера из Hermes config.yaml
+  api_key: ""               # ключ литерально из yaml; пусто = см. api_key_env/Hermes
+  api_key_env: ""           # имя env-переменной с ключом; пусто = key_env провайдера
+  model: "openai/gpt-6-luna"  # пусто = автоописание выключено, описывает агент
+  max_dim: 1280             # длинная сторона картинки (для plusvibeapi ставить 256)
+  max_tokens: 4000          # reasoning-модели: при пустом content повтор с двойным бюджетом
+  timeout: 180              # секунд на один запрос

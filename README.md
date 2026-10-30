@@ -4,7 +4,7 @@
 проектную документацию с нормами: семантический поиск по смыслу, лексический по
 формулировкам и точный переход по номеру пункта («п. 7.6.9»).
 
-Точка входа — CLI `norms.py`: подкоманды `add/search/clause/docs/status/reembed`,
+Точка входа — CLI `norms.py`: подкоманды `add/search/clause/docs/status/reembed/figures/describe`,
 флаг `--json` отдаёт результат машиночитаемо (для агента).
 
 Операционная инструкция (как закинуть ссылку, что считать успехом, что делать
@@ -18,7 +18,10 @@ PDF (URL, антибот-обход) или локальный --pdf
   -> convert.clean_page           чистка колонтитулов/номеров/отметок редакции
   -> convert.join_pages           склейка страниц: рванные абзацы и таблицы
   -> chunk.chunk_markdown         чанки по ПУНКТАМ нормы (граница = п. 7.6.9, таблица)
-  -> SQLite (data/normbase.db)    documents + chunks + chunk_clauses + FTS5 (BM25)
+  -> tables.extract_tables        таблицы -> ячейки (raw + число) в SQLite
+  -> formulas.extract_formulas    формулы -> кроп PNG + строка в SQLite (номер, якорь)
+  -> SQLite (data/normbase.db)    documents + chunks + chunk_clauses + tables
+                                 + table_cells + formulas + FTS5 (BM25)
   -> bge-m3 ONNX (1024d, L2)      батчи по 16, 8 потоков, CPU, локально
   -> Qdrant norm_docs             payload: doc_code, clause_id, clause_ids, page_*, text
 ```
@@ -41,7 +44,7 @@ primary-номер чанка — 7.6.8. В выдаче `clause_id` — зап�
 ## Структура
 
 ```
-norms.py         CLI: add/search/clause/docs/status/reembed + --json
+norms.py         CLI: add/search/clause/docs/status/reembed/figures/describe + --json
 src/norms_base/
   config.py      пути/константы (DB_PATH, QDRANT_URL, COLLECTION=norm_docs,
                  EMBED_BATCH=16, EMBED_THREADS=8, размеры чанков)
@@ -50,12 +53,21 @@ src/norms_base/
   convert.py     pdf_to_markdown: построчная чистка, карта (offset -> страница)
   chunk.py       chunk_markdown: границы по пунктам/таблицам, build_embed_text
   embed.py       Embedder: bge-m3 ONNX, ленивая сессия, L2-нормализация
-  storage.py     Store: SQLite schema, FTS5, chunk_clauses, find_clause/search_fts
+  figures.py     картинки PDF: растер + кроп по подписи «Рисунок N», таблица
+                 figures, автоописание LLM (figures.yaml) или агентом, метка
+                 <!-- fig:N --> в чанке (описание живёт в FTS и векторе)
+  tables.py      Markdown-таблицы -> ячейки (raw/num), подписи «Таблица Л.2»
+                 (включая разрядку «Т а б л и ц а»), привязка к чанку kind=table
+  formulas.py    формулы PDF: детекция по номеру «(А.6)» и математическим
+                 глифам SymbolMT -> кроп PNG в data/img, якорь, описание
+                 (--set агентом / --auto LLM), метка <!-- fml:N --> в чанке
+  storage.py     Store: SQLite schema (чанки, таблицы, формулы), FTS5,
+                 chunk_clauses, find_clause/search_fts, вшивание меток fig/fml
   vectorstore.py VectorStore: Qdrant, payload-индексы, point_id = uuid5(code:ord)
   pipeline.py    add_document(): PDF -> ... -> Qdrant, reembed_pending(), status()
   search.py      API для агента: clause/section/keyword/semantic/hybrid/docs
 tests/           smoke: конверсия фикстуры -> чанки -> FTS -> вектор -> hybrid -> статус
-data/            (в .gitignore) normbase.db, pdf/, md/ — артефакты, восстановимы
+data/            (в .gitignore) normbase.db, pdf/, md/, img/ — артефакты, восстановимы
 ```
 
 ## CLI
@@ -76,12 +88,56 @@ PY="C:/Users/olegs/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe"
 "$PY" norms.py status
 "$PY" norms.py reembed
 
+# таблицы: список, ячейки с числами (источник правды для расчётов), извлечение
+"$PY" norms.py tables --extract --doc 'СП 60.13330.2020'   # для старых документов
+"$PY" norms.py tables --show 4                              # шапка + строки с num
+
+# формулы: кропы из PDF, описание (агент --set или LLM --auto)
+"$PY" norms.py formulas --extract --doc 'СП 60.13330.2020'  # для старых документов
+"$PY" norms.py formulas --pending                           # ждут описания
+"$PY" norms.py formulas --set 6 --expr '353/(273+t_h)' --text '…'   # + reembed
+"$PY" norms.py formulas --auto                              # авто vision-моделью
+
+# картинки: вырезать из PDF, список pending, описать (агентом или --auto)
+"$PY" norms.py figures --extract --doc 'СП 60.13330.2020'
+"$PY" norms.py figures --pending
+"$PY" norms.py describe 1 --text '…'     # описание от агента
+"$PY" norms.py figures --auto             # авто через figures.yaml (нужен vision.model)
+
 # для агента: один JSON в stdout, прогресс глушится
 "$PY" norms.py search 'пожарные клапаны' --json -k 3
 ```
 
 `--limit N` (по умолчанию 400 символов) режет текст чанка в выдаче, `--full`
 отдаёт цитату целиком; полный текст любого чанка — `search.get_text(chunk_id)`.
+
+## Картинки (figures)
+
+Конвейер вырезает из PDF и картинки, а не только текст:
+
+- **растровые вставки** (`page.get_images`, ≥40 px) — PNG в `data/img/<код>/`;
+- **векторные схемы/графики** — по подписи «Рисунок N / Схема / График»:
+  кроп страницы над подписью (графика + сама подпись), если рядом нет
+  растровой картинки.
+
+Список ложится в таблицу `figures` (страница, подпись, путь, описание); `add`
+делает это сам, для старых документов — `norms.py figures --extract`. На
+СП 60.13330.2020 найдено 2 картинки (рис. Ж.1 — стр. 92, Ж.2 — стр. 96).
+
+**Описание — два режима** (задаётся в `figures.yaml`):
+
+| Режим | Условие | Как работает |
+|---|---|---|
+| агент | `vision.model` пустая (по умолчанию) | `figures --pending` печатает пути →
+|  |  | агент смотрит файл и заносит `describe <id> --text '…'` |
+| LLM | `vision.model` задана | `norms.py figures --auto [--limit N]`; |
+|  |  | base_url/ключ — из Hermes config.yaml (провайдер `auxiliary.vision`) |
+
+Описание хранится в `figures` (переживает переиндексацию) и дублируется меткой
+`<!-- fig:N --> … <!-- /fig:N -->` в тексте чанка — так оно попадает в FTS5 и в
+эмбеддинг и находится поиском вместе с пунктом, рядом с которым картинка стоит.
+После описания чанк помечен «без вектора» — `norms.py reembed`, затем `status`
+должен снова показать `СИНХРОНО`.
 
 ## Статус (2026-10-07)
 
@@ -100,11 +156,28 @@ PY="C:/Users/olegs/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe"
 - Эмбеддер замерен на реальных чанках (см. «Грабли»): старые цифры «67 текстов/сек»
   относились к коротким запросам и на длинных чанках не работают.
 - Скачиватель устойчив к антибот-челленджу ServicePipe (повтор в той же сессии).
+- Картинки PDF (2026-10-29): `figures.py` вырезает растровые вставки и векторные
+  схемы по подписи; `figures`/`describe` описывают их LLM из `figures.yaml` или
+  агент; описание вшивается в чанк и находится поиском. На СП 60 найдены и
+  описаны 2 рисунка (Ж.1, Ж.2), `sync_delta = 0`.
+- Таблицы и формулы (2026-10-29): `tables.py` разбирает Markdown-таблицы в
+  структурированные ячейки (`raw` — источник правды, `num` — разобранное
+  число), с подписью, страницой и чанком-носителем — из них читают
+  расчётно-проверочные скрипты. `formulas.py` вырезает формулы по двум
+  сигналам: отдельный номер «(А.6)» и математические глифы SymbolMT
+  (PUA-коды) — в Markdown эти формулы теряются/сплющиваются. На СП 60:
+  20 таблиц (1005 ячеек, 402 числа) и 51 формула (все с номером), кропы в
+  `data/img/<код>/f_pNNN_KK.png`. Описание формулы вшивается меткой
+  `<!-- fml:N -->` в чанк и находится FTS/вектором; `status` считает
+  `tables`, `formulas`, `pending_formulas`. Команды `tables`/`formulas`
+  в `--json` изолируют вывод сторонних библиотек (RapidOCR) в stderr.
 
 **Не сделано / ограничения**
 
 - Второй и последующие документы ещё не инжестовались (процедура ниже).
 - Калибровка порога сделана на одном документе; после 2-3 инжестов повторить.
+- Формулы извлечены, но не описаны: 51 `pending_formulas` — заполнить через
+  `formulas --set` (агент) или `formulas --auto` (vision-модель), затем `reembed`.
 
 ## Как подключить следующий документ
 
@@ -169,9 +242,19 @@ PY="C:/Users/olegs/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe"
   (кодировка CP1251 у вывода) — не влияет на результат, но в pytest даёт варнинги
   `PytestUnhandledThreadExceptionWarning` (гасятся `-p no:warnings`).
 - **Qdrant**: чтение payload — `POST /collections/{c}/points/scroll` (GET отвергается).
+- **Внешняя LLM для картинок (`figures --auto`).** Шлюз plusvibeapi рвёт соединение на
+  base64 больше ~10 КБ, поэтому `deepseek-v4.1-flash-1017` там требует `max_dim=256`,
+  а на 256 px мелкие подписи читает неточно (легенду «m=2» видит как «0,2»).
+  Рабочая связка — routerai: `deepseek/deepseek-v4.1-flash` (имени с суффиксом `-1017`
+  там нет — даёт 400) при полном `max_dim=1280`, подписи верные. Reasoning-моделям
+  нужен `max_tokens: 2000`, иначе `content` пустой (бюджет съедают размышления).
 - **`execute_code` (ядро Hermes) — другой интерпретатор**, в нём нет
   pymupdf4llm/qdrant_client/onnxruntime; запускать код проекта через
   `C:/Users/olegs/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe`.
+  И даже subprocess оттуда ломается: `PYTHONPATH` ядра подмешивает чужой
+  site-packages (numpy под Python 3.14 в интерпретаторе 3.11 даёт
+  `No module named 'numpy._core._multiarray_umath'`) — проектный код
+  запускать только через `terminal`.
 - **Ставить пакеты** в этот venv: `uv pip install --python "...venv/Scripts/python.exe" <pkg>`.
 - **Многострочный код через `python -c`** в git-bash не проходит (bash оставляет `\n`
   буквами даже после `json.dumps`) — писать скрипт в файл и запускать файл.

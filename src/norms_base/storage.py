@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -77,6 +78,74 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     chunk_id UNINDEXED, doc_code UNINDEXED,
     tokenize = 'unicode61 remove_diacritics 2'
 );
+
+-- Описанные картинки PDF: файл лежит в data/img, description — источник
+-- правды (переживает переиндексацию) и дублируется меткой <!-- fig:N -->
+-- в тексте чанка, чтобы находиться FTS и вектором.
+CREATE TABLE IF NOT EXISTS figures (
+    figure_id    INTEGER PRIMARY KEY,
+    doc_id       INTEGER NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    page         INTEGER,
+    kind         TEXT NOT NULL,          -- raster | crop
+    xref         INTEGER,
+    caption      TEXT,
+    bbox         TEXT,
+    path         TEXT NOT NULL,
+    description  TEXT,
+    described_by TEXT,
+    described_at TEXT,
+    UNIQUE (doc_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_figures_doc ON figures(doc_id);
+
+-- Структурированные таблицы документа: ячейки с числами — источник правды
+-- для расчётно-проверочных скриптов (текст чанка рядом, но скрипт берёт num).
+CREATE TABLE IF NOT EXISTS tables (
+    table_id    INTEGER PRIMARY KEY,
+    doc_id      INTEGER NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    chunk_id    INTEGER REFERENCES chunks(chunk_id) ON DELETE SET NULL,
+    ord         INTEGER NOT NULL,
+    caption     TEXT,
+    page_start  INTEGER,
+    page_end    INTEGER,
+    header      TEXT NOT NULL,          -- JSON-массив шапки
+    row_count   INTEGER NOT NULL,
+    col_count   INTEGER NOT NULL,
+    UNIQUE (doc_id, ord)
+);
+CREATE INDEX IF NOT EXISTS idx_tables_doc ON tables(doc_id);
+
+-- Ячейки: row_idx 0 — шапка, 1..N строки данных; num — разобранное число
+-- (NULL, если значение неоднозначно: «2/3», «–»), raw — источник правды.
+CREATE TABLE IF NOT EXISTS table_cells (
+    table_id INTEGER NOT NULL REFERENCES tables(table_id) ON DELETE CASCADE,
+    row_idx  INTEGER NOT NULL,
+    col_idx  INTEGER NOT NULL,
+    raw      TEXT NOT NULL,
+    num      REAL,
+    PRIMARY KEY (table_id, row_idx, col_idx)
+);
+
+-- Формулы: кроп из PDF (data/img/<код>/f_pNNN_KK.png) + распознавание.
+-- Описания переживают переиндексацию (path уникален в документе) и
+-- вшиваются меткой <!-- fml:N --> в чанк — так находятся FTS и вектором.
+CREATE TABLE IF NOT EXISTS formulas (
+    formula_id   INTEGER PRIMARY KEY,
+    doc_id       INTEGER NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    tag          TEXT,                  -- номер формулы: «А.6» (или NULL)
+    page         INTEGER,
+    bbox         TEXT,
+    path         TEXT NOT NULL,
+    anchor       TEXT,                  -- якорный текст документа («…по формуле:»)
+    latex        TEXT,
+    expr         TEXT,                  -- вычисляемое выражение для скриптов
+    params       TEXT,                  -- JSON: символ -> расшифровка/единицы
+    description  TEXT,                  -- проза для поиска (источник правды)
+    described_by TEXT,
+    described_at TEXT,
+    UNIQUE (doc_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_formulas_doc ON formulas(doc_id);
 """
 
 _TOKEN = re.compile(r"\w+", re.UNICODE)
@@ -107,6 +176,61 @@ def parse_clause_ids(raw: Any) -> tuple[str, ...]:
 CLAUSE_IDS_EXPR = """COALESCE((SELECT group_concat(cl.clause_id, ',')
               FROM (SELECT clause_id FROM chunk_clauses WHERE chunk_id = c.chunk_id ORDER BY rowid) cl
              ), '')"""
+
+def _strip_figure_note(text: str, figure_id: int) -> str:
+    """Убирает старую метку описания картинки из текста (идемпотентная вшивка)."""
+    return re.sub(
+        rf"<!-- fig:{figure_id} -->.*?<!-- /fig:{figure_id} -->\n?",
+        "", text, flags=re.S,
+    )
+
+def _strip_formula_note(text: str, formula_id: int) -> str:
+    """Убирает старую метку описания формулы (идемпотентная вшивка)."""
+    return re.sub(
+        rf"<!-- fml:{formula_id} -->.*?<!-- /fml:{formula_id} -->\n?",
+        "", text, flags=re.S,
+    )
+
+
+def _strip_all_formula_notes(text: str) -> str:
+    """Убирает все метки описаний формул разом (перенос носителя, чистка)."""
+    return re.sub(
+        r"<!-- fml:\d+ -->.*?<!-- /fml:\d+ -->\n?", "", text, flags=re.S
+    ).strip("\n")
+
+
+def _formula_note(formula: sqlite3.Row) -> str | None:
+    """Метка описания формулы для вшивки в чанк; None — пока описания нет.
+
+    Номер («Формула (А.6)»), проза, выражение и параметры попадают в текст
+    и в ``embed_text`` — так формула находится FTS и вектором вместе со
+    своим пунктом, а скрипт берёт ``expr``/``params`` прямо из строки.
+    """
+    tag = (formula["tag"] or "").strip()
+    label = f"Формула ({tag})" if tag else "Формула"
+    description = (formula["description"] or "").strip()
+    latex = (formula["latex"] or "").strip()
+    expr = (formula["expr"] or "").strip()
+    body = description or latex or expr
+    if not body:
+        return None
+    lines = [f"**{label}** (стр. {formula['page']}): {body}"]
+    if expr and expr not in body:
+        lines.append(f"Выражение: {expr}")
+    raw_params = formula["params"]
+    if raw_params:
+        try:
+            params = json.loads(raw_params)
+        except (TypeError, ValueError):
+            params = {}
+        if isinstance(params, dict) and params:
+            lines.append(
+                "Параметры: "
+                + "; ".join(f"{key} — {value}" for key, value in params.items())
+            )
+    note_body = "\n".join(lines)
+    return f"<!-- fml:{formula['formula_id']} -->\n{note_body}\n<!-- /fml:{formula['formula_id']} -->"
+
 
 SELECT_COLUMNS = f"""
     c.chunk_id, c.doc_id, c.ord, c.kind, c.clause_id, c.section, c.section_title,
@@ -277,6 +401,477 @@ class Store:
     def commit(self) -> None:
         self.conn.commit()
 
+    # ---------------------------------------------------------------- figures
+    def upsert_figure(self, **fields: Any) -> int:
+        """Ставит картинку в таблицу (путь уникален в документе); описание не трогает."""
+        conn = self.conn
+        row = conn.execute(
+            "SELECT figure_id FROM figures WHERE doc_id = ? AND path = ?",
+            (fields["doc_id"], fields["path"]),
+        ).fetchone()
+        if row is None:
+            columns = ", ".join(fields)
+            placeholders = ", ".join("?" for _ in fields)
+            cursor = conn.execute(
+                f"INSERT INTO figures ({columns}) VALUES ({placeholders})",
+                tuple(fields.values()),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+        figure_id = int(row["figure_id"])
+        conn.execute(
+            "UPDATE figures SET page = ?, kind = ?, xref = ?, caption = ?, bbox = ? "
+            "WHERE figure_id = ?",
+            (
+                fields.get("page"), fields.get("kind"), fields.get("xref"),
+                fields.get("caption"), fields.get("bbox"), figure_id,
+            ),
+        )
+        conn.commit()
+        return figure_id
+
+    def list_figures(
+        self, doc_code: str | None = None, *, pending: bool | None = None
+    ) -> list[sqlite3.Row]:
+        sql = """SELECT f.*, d.code AS doc_code, d.title AS doc_title
+                   FROM figures f JOIN documents d ON d.doc_id = f.doc_id
+                  WHERE 1 = 1"""
+        params: list[Any] = []
+        if doc_code:
+            sql += " AND d.code = ?"
+            params.append(doc_code)
+        if pending is True:
+            sql += " AND f.description IS NULL"
+        elif pending is False:
+            sql += " AND f.description IS NOT NULL"
+        sql += " ORDER BY d.code, f.page, f.figure_id"
+        return list(self.conn.execute(sql, params))
+
+    def get_figure(self, figure_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT f.*, d.code AS doc_code FROM figures f"
+            " JOIN documents d ON d.doc_id = f.doc_id WHERE f.figure_id = ?",
+            (figure_id,),
+        ).fetchone()
+
+    def set_figure_description(
+        self, figure_id: int, text: str, by: str = "agent"
+    ) -> tuple[sqlite3.Row, int | None]:
+        """Записывает описание и вшивает его в чанк-носитель меткой fig:N."""
+        self.conn.execute(
+            "UPDATE figures SET description = ?, described_by = ?, described_at = ? "
+            "WHERE figure_id = ?",
+            (
+                str(text).strip(), by,
+                datetime.now().isoformat(timespec="seconds"), figure_id,
+            ),
+        )
+        row = self.get_figure(figure_id)
+        if row is None:
+            self.conn.commit()
+            raise ValueError(f"картинка id={figure_id} не найдена")
+        chunk_id = self.apply_figure_note(row)
+        self.conn.commit()
+        return row, chunk_id
+
+    def apply_figure_note(self, figure: sqlite3.Row) -> int | None:
+        """Переписывает метку описания в тексте чанка (идемпотентно)."""
+        figure_id = int(figure["figure_id"])
+        description = figure["description"]
+        if not description:
+            return None
+        chunk = self._figure_chunk(figure)
+        if chunk is None:
+            return None
+        caption = (figure["caption"] or "").strip()
+        caption = caption or f"Изображение (стр. {figure['page']})"
+        note = (
+            f"<!-- fig:{figure_id} -->\n"
+            f"**{caption}** (стр. {figure['page']}): {description}\n"
+            f"<!-- /fig:{figure_id} -->"
+        )
+        return self._apply_note(
+            chunk, note, lambda text: _strip_figure_note(text, figure_id)
+        )
+
+    def _apply_note(self, chunk: sqlite3.Row, note: str, strip) -> int:
+        """Вшивает готовую метку в чанк: текст, embed_text, FTS, устаревший вектор.
+
+        Общий путь для описаний картинок и формул: ``embedded_at = NULL``
+        означает «вектор чанка устарел» — доэмбеджит ``norms.py reembed``.
+        """
+        text = strip(chunk["text"] or "")
+        base_embed = chunk["embed_text"] or chunk["text"] or ""
+        embed_text = strip(base_embed)
+        new_text = f"{text}\n\n{note}".strip()
+        new_embed = f"{embed_text}\n\n{note}".strip()
+        return self._write_chunk_text(chunk, new_text, new_embed)
+
+    def _write_chunk_text(self, chunk: sqlite3.Row, new_text: str, new_embed: str) -> int:
+        """Переписывает текст/embed чанка и его FTS-строку, помечая вектор устаревшим."""
+        self.conn.execute(
+            "UPDATE chunks SET text = ?, embed_text = ?, embedded_at = NULL "
+            "WHERE chunk_id = ?",
+            (new_text, new_embed, chunk["chunk_id"]),
+        )
+        # FTS хранит своё копие текста — меняем его тем же способом
+        self.conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk["chunk_id"],))
+        clause_ids = " ".join(
+            r["clause_id"]
+            for r in self.conn.execute(
+                "SELECT clause_id FROM chunk_clauses WHERE chunk_id = ? ORDER BY rowid",
+                (chunk["chunk_id"],),
+            )
+        )
+        doc_code = self.conn.execute(
+            "SELECT code FROM documents WHERE doc_id = ?", (chunk["doc_id"],)
+        ).fetchone()[0]
+        self.conn.execute(
+            "INSERT INTO chunks_fts (text, clause_id, section_title, chunk_id, doc_code) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                new_text, clause_ids, chunk["section_title"] or "",
+                chunk["chunk_id"], doc_code,
+            ),
+        )
+        return int(chunk["chunk_id"])
+
+    def reapply_figure_notes(self, doc_id: int) -> int:
+        """Заново вшивает описания в чанки (replace_chunks их вырезал)."""
+        rows = list(
+            self.conn.execute(
+                "SELECT * FROM figures WHERE doc_id = ? AND description IS NOT NULL",
+                (doc_id,),
+            )
+        )
+        for figure in rows:
+            self.apply_figure_note(figure)
+        return len(rows)
+
+    def _figure_chunk(self, figure: sqlite3.Row) -> sqlite3.Row | None:
+        """Чанк-носитель картинки: сначала по подписи, иначе по странице."""
+        caption = (figure["caption"] or "")[:12]
+        if caption:
+            row = self.conn.execute(
+                "SELECT * FROM chunks WHERE doc_id = ? AND instr(text, ?) > 0 "
+                "ORDER BY LENGTH(text) LIMIT 1",
+                (figure["doc_id"], caption),
+            ).fetchone()
+            if row is not None:
+                return row
+        page = figure["page"]
+        if page:
+            row = self.conn.execute(
+                "SELECT * FROM chunks WHERE doc_id = ? AND page_start IS NOT NULL "
+                "AND page_start <= ? AND page_end >= ? "
+                "ORDER BY LENGTH(text) LIMIT 1",
+                (figure["doc_id"], page, page),
+            ).fetchone()
+            if row is not None:
+                return row
+        return None
+
+    # ---------------------------------------------------------------- tables
+    def replace_tables(self, doc_id: int, rows: Sequence[dict[str, Any]]) -> int:
+        """Полная замена структурированных таблиц документа (идемпотентно).
+
+        Чанк-носитель ищется по характерной ячейке (``match_text``): самая
+        короткая строка чанка, содержащая подстроку, — так таблица цепляется
+        за свой же чанк ``kind=table``, а не за соседний.
+        """
+        from .tables import parse_number
+
+        conn = self.conn
+        conn.execute("DELETE FROM tables WHERE doc_id = ?", (doc_id,))
+        for row in rows:
+            chunk_id = self._chunk_by_text(doc_id, row.get("match_text") or "")
+            header = list(row.get("header") or [])
+            data_rows = [list(item) for item in row.get("rows") or []]
+            col_count = max([len(header)] + [len(item) for item in data_rows], default=0)
+            cursor = conn.execute(
+                "INSERT INTO tables (doc_id, chunk_id, ord, caption, page_start,"
+                " page_end, header, row_count, col_count)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    doc_id, chunk_id, row["ord"], row.get("caption") or "",
+                    row.get("page_start"), row.get("page_end"),
+                    json.dumps(header, ensure_ascii=False),
+                    len(data_rows), col_count,
+                ),
+            )
+            table_id = int(cursor.lastrowid)
+            cells = [(0, col, value) for col, value in enumerate(header)]
+            for row_idx, data_row in enumerate(data_rows, start=1):
+                cells.extend((row_idx, col, value) for col, value in enumerate(data_row))
+            conn.executemany(
+                "INSERT INTO table_cells (table_id, row_idx, col_idx, raw, num)"
+                " VALUES (?, ?, ?, ?, ?)",
+                [
+                    (table_id, row_idx, col, str(value), parse_number(value))
+                    for row_idx, col, value in cells
+                ],
+            )
+        conn.commit()
+        return len(rows)
+
+    def _chunk_by_text(self, doc_id: int, needle: str) -> int | None:
+        """Чанк-носитель по подстроке; None — подстрока короткая или не найдена."""
+        needle = needle.strip()
+        if len(needle) < 4:
+            return None
+        row = self.conn.execute(
+            "SELECT chunk_id FROM chunks WHERE doc_id = ? AND instr(text, ?) > 0"
+            " ORDER BY LENGTH(text) LIMIT 1",
+            (doc_id, needle),
+        ).fetchone()
+        return int(row["chunk_id"]) if row else None
+
+    def list_tables(self, doc_code: str | None = None) -> list[sqlite3.Row]:
+        sql = """SELECT t.*, d.code AS doc_code
+                   FROM tables t JOIN documents d ON d.doc_id = t.doc_id
+                  WHERE 1 = 1"""
+        params: list[Any] = []
+        if doc_code:
+            sql += " AND d.code = ?"
+            params.append(doc_code)
+        sql += " ORDER BY d.code, t.ord"
+        return list(self.conn.execute(sql, params))
+
+    def get_table(self, table_id: int) -> dict[str, Any] | None:
+        """Шапка + ячейки строк данных: raw (источник правды) и num (число)."""
+        head = self.conn.execute(
+            "SELECT t.*, d.code AS doc_code FROM tables t"
+            " JOIN documents d ON d.doc_id = t.doc_id WHERE t.table_id = ?",
+            (table_id,),
+        ).fetchone()
+        if head is None:
+            return None
+        grid: dict[int, dict[int, dict[str, Any]]] = {}
+        for cell in self.conn.execute(
+            "SELECT row_idx, col_idx, raw, num FROM table_cells"
+            " WHERE table_id = ? ORDER BY row_idx, col_idx",
+            (table_id,),
+        ):
+            grid.setdefault(int(cell["row_idx"]), {})[int(cell["col_idx"])] = {
+                "raw": cell["raw"],
+                "num": cell["num"],
+            }
+        data_rows = [
+            [
+                grid.get(row_idx, {}).get(col, {"raw": "", "num": None})
+                for col in range(int(head["col_count"]))
+            ]
+            for row_idx in range(1, int(head["row_count"]) + 1)
+        ]
+        return {
+            "table_id": int(head["table_id"]),
+            "doc_code": head["doc_code"],
+            "caption": head["caption"] or "",
+            "page_start": head["page_start"],
+            "page_end": head["page_end"],
+            "chunk_id": head["chunk_id"],
+            "header": json.loads(head["header"] or "[]"),
+            "row_count": head["row_count"],
+            "col_count": head["col_count"],
+            "rows": data_rows,
+        }
+
+    # -------------------------------------------------------------- formulas
+    def upsert_formula(self, **fields: Any) -> int:
+        """Ставит формулу в таблицу (путь уникален в документе); описание не трогает."""
+        conn = self.conn
+        row = conn.execute(
+            "SELECT formula_id FROM formulas WHERE doc_id = ? AND path = ?",
+            (fields["doc_id"], fields["path"]),
+        ).fetchone()
+        if row is None:
+            columns = ", ".join(fields)
+            placeholders = ", ".join("?" for _ in fields)
+            cursor = conn.execute(
+                f"INSERT INTO formulas ({columns}) VALUES ({placeholders})",
+                tuple(fields.values()),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+        formula_id = int(row["formula_id"])
+        conn.execute(
+            "UPDATE formulas SET tag = ?, page = ?, bbox = ?, anchor = ?"
+            " WHERE formula_id = ?",
+            (
+                fields.get("tag"), fields.get("page"), fields.get("bbox"),
+                fields.get("anchor"), formula_id,
+            ),
+        )
+        conn.commit()
+        return formula_id
+
+    def drop_missing_formulas(self, doc_id: int, keep: Sequence[str]) -> None:
+        """Удаляет формулы документа, чьих файлов больше нет (PDF изменился).
+
+        Пустой ``keep`` ничего не трогает: нулевой результат извлечения —
+        не повод стирать уже записанные описания.
+        """
+        if not keep:
+            return
+        placeholders = ",".join("?" for _ in keep)
+        self.conn.execute(
+            f"DELETE FROM formulas WHERE doc_id = ? AND path NOT IN ({placeholders})",
+            (doc_id, *keep),
+        )
+
+    def list_formulas(
+        self, doc_code: str | None = None, *, pending: bool | None = None
+    ) -> list[sqlite3.Row]:
+        sql = """SELECT f.*, d.code AS doc_code, d.title AS doc_title
+                   FROM formulas f JOIN documents d ON d.doc_id = f.doc_id
+                  WHERE 1 = 1"""
+        params: list[Any] = []
+        if doc_code:
+            sql += " AND d.code = ?"
+            params.append(doc_code)
+        empty = ("(COALESCE(f.description, '') = '' AND COALESCE(f.expr, '') = ''"
+                 " AND COALESCE(f.latex, '') = '')")
+        if pending is True:
+            sql += f" AND {empty}"
+        elif pending is False:
+            sql += f" AND NOT {empty}"
+        sql += " ORDER BY d.code, f.page, f.formula_id"
+        return list(self.conn.execute(sql, params))
+
+    def get_formula(self, formula_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT f.*, d.code AS doc_code FROM formulas f"
+            " JOIN documents d ON d.doc_id = f.doc_id WHERE f.formula_id = ?",
+            (formula_id,),
+        ).fetchone()
+
+    def set_formula_data(
+        self,
+        formula_id: int,
+        *,
+        latex: str | None = None,
+        expr: str | None = None,
+        params: dict[str, Any] | None = None,
+        description: str | None = None,
+        by: str = "agent",
+    ) -> tuple[sqlite3.Row, int | None]:
+        """Заполняет распознавание формулы и вшивает метку в чанк-носитель.
+
+        Не переданные поля остаются прежними; вставка метки помечает чанк
+        «без вектора» (``embedded_at = NULL``) — после описания нужен
+        ``norms.py reembed``.
+        """
+        row = self.get_formula(formula_id)
+        if row is None:
+            raise ValueError(f"формула id={formula_id} не найдена")
+        merged = {
+            "latex": row["latex"] if latex is None else str(latex).strip(),
+            "expr": row["expr"] if expr is None else str(expr).strip(),
+            "params": (
+                row["params"] if params is None
+                else json.dumps(params, ensure_ascii=False)
+            ),
+            "description": (
+                row["description"] if description is None
+                else str(description).strip()
+            ),
+        }
+        self.conn.execute(
+            "UPDATE formulas SET latex = ?, expr = ?, params = ?, description = ?,"
+            " described_by = ?, described_at = ? WHERE formula_id = ?",
+            (
+                merged["latex"], merged["expr"], merged["params"],
+                merged["description"], by,
+                datetime.now().isoformat(timespec="seconds"), formula_id,
+            ),
+        )
+        row = self.get_formula(formula_id)
+        chunk_id = self.apply_formula_note(row)
+        self.conn.commit()
+        return row, chunk_id
+
+    def apply_formula_note(self, formula: sqlite3.Row) -> int | None:
+        """Переписывает метку описания формулы в тексте чанка (идемпотентно)."""
+        note = _formula_note(formula)
+        if note is None:
+            return None
+        chunk = self._formula_chunk(formula)
+        if chunk is None:
+            return None
+        return self._apply_note(
+            chunk, note,
+            lambda text: _strip_formula_note(text, int(formula["formula_id"])),
+        )
+
+    def reapply_formula_notes(self, doc_id: int) -> int:
+        """Заново вшивает описания формул в чанки (replace_chunks их вырезал).
+
+        Сначала все метки ``fml`` снимаются с чанков документа: чанк-носитель
+        может смениться (тег «(А.2)» встречается и в ссылках на другие пункты),
+        и старый носитель не должен удерживать чужое описание.
+        """
+        for chunk in list(
+            self.conn.execute(
+                "SELECT * FROM chunks WHERE doc_id = ?"
+                " AND instr(text, '<!-- fml:') > 0",
+                (doc_id,),
+            )
+        ):
+            cleaned_text = _strip_all_formula_notes(chunk["text"] or "")
+            cleaned_embed = _strip_all_formula_notes(chunk["embed_text"] or chunk["text"] or "")
+            if cleaned_text != (chunk["text"] or ""):
+                self._write_chunk_text(chunk, cleaned_text, cleaned_embed)
+        rows = list(
+            self.conn.execute(
+                "SELECT * FROM formulas WHERE doc_id = ?"
+                " AND (description IS NOT NULL OR latex IS NOT NULL"
+                "      OR expr IS NOT NULL)",
+                (doc_id,),
+            )
+        )
+        for formula in rows:
+            self.apply_formula_note(formula)
+        return len(rows)
+
+    def _formula_chunk(self, formula: sqlite3.Row) -> sqlite3.Row | None:
+        """Чанк-носитель формулы: тег на странице формулы > тег где угодно > страница.
+
+        «(А.2)» встречается в ссылках по всему документу («по формуле (А.2)…») —
+        брать самый короткий чанк с тегом значило бы вшивать описание в чужой
+        пункт; привязка к странице формулы отсекает такие ссылки.
+        """
+        tag = (formula["tag"] or "").strip()
+        page = formula["page"]
+        if tag:
+            needle = f"({tag})"
+            if page:
+                row = self.conn.execute(
+                    "SELECT * FROM chunks WHERE doc_id = ?"
+                    " AND page_start IS NOT NULL AND page_start <= ? AND page_end >= ?"
+                    " AND instr(text, ?) > 0"
+                    " ORDER BY LENGTH(text) LIMIT 1",
+                    (formula["doc_id"], page, page, needle),
+                ).fetchone()
+                if row is not None:
+                    return row
+            row = self.conn.execute(
+                "SELECT * FROM chunks WHERE doc_id = ? AND instr(text, ?) > 0"
+                " ORDER BY LENGTH(text) LIMIT 1",
+                (formula["doc_id"], needle),
+            ).fetchone()
+            if row is not None:
+                return row
+        if page:
+            row = self.conn.execute(
+                "SELECT * FROM chunks WHERE doc_id = ? AND page_start IS NOT NULL"
+                " AND page_start <= ? AND page_end >= ?"
+                " ORDER BY LENGTH(text) LIMIT 1",
+                (formula["doc_id"], page, page),
+            ).fetchone()
+            if row is not None:
+                return row
+        return None
+
     # ------------------------------------------------------------------ search
 
     def search_fts(
@@ -361,6 +956,20 @@ class Store:
             "clauses": clauses,
             "embedded": embedded,
             "pending_embedding": chunks - embedded,
+            "figures": self.conn.execute(
+                "SELECT COUNT(*) AS n FROM figures"
+            ).fetchone()["n"],
+            "tables": self.conn.execute(
+                "SELECT COUNT(*) AS n FROM tables"
+            ).fetchone()["n"],
+            "formulas": self.conn.execute(
+                "SELECT COUNT(*) AS n FROM formulas"
+            ).fetchone()["n"],
+            "pending_formulas": self.conn.execute(
+                "SELECT COUNT(*) AS n FROM formulas"
+                " WHERE COALESCE(description, '') = ''"
+                " AND COALESCE(expr, '') = '' AND COALESCE(latex, '') = ''"
+            ).fetchone()["n"],
             "chars": chars,
             "db_path": str(self.db_path),
         }

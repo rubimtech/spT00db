@@ -19,6 +19,12 @@ DATA_DIR = DB_PATH.parent
 PDF_DIR = DATA_DIR / "pdf"
 MD_DIR = DATA_DIR / "md"
 
+#: Вырезанные из PDF картинки (файлы таблицы figures, data/img/<код>).
+IMG_DIR = DATA_DIR / "img"
+
+#: Конфиг описания картинок: vision.model пустой — описывает агент.
+FIGURES_YAML = REPO_ROOT / "figures.yaml"
+
 #: Векторный индекс: 1024d Cosine — то же пространство, что у ws-* коллекций и memory-store.
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.environ.get("NORMS_COLLECTION", "norm_docs")
@@ -57,7 +63,7 @@ EMBED_THREADS = int(os.environ.get("NORMS_EMBED_THREADS", "8"))
 
 def ensure_dirs() -> None:
     """Создаёт каталоги данных (вызывается CLI перед работой)."""
-    for path in (DATA_DIR, PDF_DIR, MD_DIR):
+    for path in (DATA_DIR, PDF_DIR, MD_DIR, IMG_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if DB_PATH.parent != DATA_DIR:  # pragma: no cover - защита от рассинхрона путей
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)

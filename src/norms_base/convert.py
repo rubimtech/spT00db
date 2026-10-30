@@ -67,9 +67,23 @@ class DocMarkdown:
 
 
 def pdf_to_markdown(pdf_path: Path | str, doc_code: str) -> DocMarkdown:
-    """Конвертирует PDF в чищенный Markdown с картой страниц."""
-    import pymupdf4llm
+    """Конвертирует PDF в чищенный Markdown с картой страниц.
 
+    Для PDF с большим числом страниц-картинок (>5% от всех) использует
+    прямой pymupdf без медленного OCR pymupdf4llm.
+    """
+    pdf_path = Path(pdf_path)
+
+    # Проверяем: сколько страниц без текста (нужны OCR)
+    import pymupdf
+    probe = pymupdf.open(str(pdf_path))
+    total = len(probe)
+    blank = sum(1 for pno in range(total) if len(probe[pno].get_text().strip()) < 50)
+    probe.close()
+    if blank > max(3, int(total * 0.02)):
+        return _fallback_pymupdf(pdf_path, doc_code)
+
+    import pymupdf4llm
     raw_pages = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True, verbose=False)
     if not raw_pages:
         raise ValueError(f"pymupdf4llm не вернул страниц для {pdf_path}")
@@ -86,6 +100,28 @@ def pdf_to_markdown(pdf_path: Path | str, doc_code: str) -> DocMarkdown:
         spans=spans,
         page_count=int(meta.get("page_count") or len(pages)),
         meta=meta,
+    )
+
+
+def _fallback_pymupdf(pdf_path: Path | str, doc_code: str) -> DocMarkdown:
+    """Прямое извлечение текста через pymupdf, без OCR."""
+    import pymupdf
+
+    doc = pymupdf.open(str(pdf_path))
+    pages: list[PageText] = []
+    for pno in range(len(doc)):
+        page = doc[pno]
+        text = page.get_text()
+        if not text.strip():
+            text = f"_[Страница {pno + 1}: изображение без текста]_"
+        pages.append(PageText(number=pno + 1, text=clean_page(text, doc_code)))
+    doc.close()
+    text, spans = join_pages(pages)
+    return DocMarkdown(
+        text=text,
+        spans=spans,
+        page_count=len(pages),
+        meta={},
     )
 
 

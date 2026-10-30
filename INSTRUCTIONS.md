@@ -31,6 +31,9 @@ uv pip install --python "C:/Users/olegs/AppData/Local/hermes/hermes-agent/venv/S
 | `NORMS_COLLECTION` | коллекция векторов | `norm_docs` (1024d, Cosine) |
 | `NORMS_BGE_M3` | модель bge-m3 (ONNX) | `%LOCALAPPDATA%/hermes/models/bge-m3-onnx` |
 | `NORMS_EMBED_THREADS` | потоки эмбеддинга | `8` |
+| `NORMS_VISION_MODEL` | vision-модель для `figures --auto` | пусто = описывает агент |
+| `NORMS_VISION_BASE_URL` | адрес API картинок | из Hermes config.yaml |
+| `NORMS_VISION_API_KEY_ENV` | имя env-переменной с ключом | key_env провайдера |
 
 Qdrant должен быть поднят — без него инжест не пройдёт (`status` покажет
 `qdrant_points: недоступно`).
@@ -99,7 +102,9 @@ Cloudflare и т.п.). Парсер повторяет запрос **в той 
 - [ ] в `docs` появилась строка нового документа, `indexed_at` — дата, а не `None`;
 - [ ] `clause '<код>' '<номер>'` возвращает пункт, в цитате есть номер и страницы;
 - [ ] `clauses` в `status` больше числа пунктов «на глазок» — проверить, что
-      пропусков нет (для СП 60.13330.2020 вышло 422 пункта из 422 строк в MD).
+      пропусков нет (для СП 60.13330.2020 вышло 422 пункта из 422 строк в MD);
+- [ ] `tables` и `formulas` в `status` ненулевые (для СП 60 — 20 и 51),
+      `pending_formulas` показывает, сколько формул ещё ждут описания.
 
 Пример успешного `status`:
 
@@ -109,6 +114,10 @@ chunks: 305
 clauses: 422
 embedded: 305
 pending_embedding: 0
+figures: 2
+tables: 20
+formulas: 51
+pending_formulas: 51
 qdrant_points: 305
 sync_delta: 0
 СИНХРОНО
@@ -191,6 +200,12 @@ sync_delta: 0
    `top-1` у `--mode semantic`, убедиться, что шум и цели не пересекаются.
    Числа в README, раздел «Пороги», обновить.
 4. Добавить в README строку в «Источник» (код, название, URL).
+5. Вырезать и описать картинки: `figures --extract`, затем `figures --pending`
+   и `describe <id> --text` (или `figures --auto`, если задан `vision.model`),
+   потом `reembed` → `СИНХРОНО` (раздел 9).
+6. Таблицы и формулы при `add` извлекаются сами; для старых документов —
+   `tables --extract` и `formulas --extract`, потом описать формулы
+   (раздел 10) и `reembed`.
 
 ---
 
@@ -209,7 +224,78 @@ sync_delta: 0
 
 ---
 
-## 9. Мини-шпаргалка
+## 9. Картинки (изображения)
+
+Конвейер вырезает из PDF картинки сам: растровые вставки и векторные схемы
+с подписью «Рисунок N» (кроп страницы над подписью) кладутся в `data/img/<код>/`,
+строки попадают в таблицу `figures`. При `add` это происходит автоматически;
+для уже проиндексированных документов:
+
+```bash
+"$PY" norms.py figures --extract --doc 'СП 60.13330.2020'   # вырезать
+"$PY" norms.py figures --pending                             # что ждёт описания
+```
+
+**Описывать — двумя способами (`figures.yaml`):**
+
+1. `vision.model` пустая (по умолчанию) — режим агента: смотрит файл
+   из вывода `figures` и заносит описание:
+   `"$PY" norms.py describe 1 --text '…'`
+2. `vision.model` задана — авто внешней LLM: `"$PY" norms.py figures --auto`
+   (base_url/ключ берутся из Hermes config.yaml; разово без правки файла:
+   `NORMS_VISION_MODEL=qwen/qwen3-vl-235b-a22b-instruct "$PY" norms.py figures --auto`).
+
+Описание пишется в `figures` (переживает переиндексацию) и вшивается меткой
+`<!-- fig:N --> … <!-- /fig:N -->` в текст чанка — оно попадает в FTS и в
+эмбеддинг. После описания чанк помечен «без вектора», обязательный шаг:
+
+```bash
+"$PY" norms.py reembed && "$PY" norms.py status    # снова СИНХРОНО
+```
+
+Проверка: `norms.py search '<уникальная фраза из описания>' --mode keyword`
+находит чанк с меткой.
+
+## 10. Таблицы и формулы (данные для расчётных скриптов)
+
+Эти объекты — источник правды для расчётно-проверочных скриптов: скрипт
+берёт числа из `table_cells.num`, а не парсит текст чанка, и берёт формулу
+из `formulas.expr`/`formulas.params`, а не сочиняет её по памяти.
+
+```bash
+# таблицы: список и ячейки (у старых документов сначала --extract)
+"$PY" norms.py tables --extract --doc 'СП 60.13330.2020'
+"$PY" norms.py tables                       # id, страницы, размеры, подписи
+"$PY" norms.py tables --show 4              # шапка + строки raw/num
+
+# формулы: кропы (при add режутся сами)
+"$PY" norms.py formulas --extract --doc 'СП 60.13330.2020'
+"$PY" norms.py formulas --pending           # список с путями к PNG
+"$PY" norms.py formulas --set 6 --text 'Плотность приточного воздуха…' \
+                         --expr '353/(273+t_h)' --params '{"t_h": "t наружного, °С"}'
+"$PY" norms.py formulas --auto              # то же vision-моделью (figures.yaml)
+"$PY" norms.py formulas --drop 12            # удалить ложную формулу
+"$PY" norms.py reembed                      # ОБЯЗАТЕЛЬНО после описания
+```
+
+Как это работает:
+
+- **таблица** — это строки `tables` + ячейки `table_cells` (`raw` — что в
+  документе, `num` — разобранное число, `NULL` если неоднозначно: «2/3»,
+  «–»), плюс подпись, страницы и `chunk_id`-носитель (`kind=table`);
+- **формула** — строка `formulas` (номер «А.6», страница, якорный текст)
+  и PNG-кроп в `data/img/<код>/f_pNNN_KK.png`; распознавание (`latex`,
+  `expr`, `params`, `description`) заполняет агент (`--set`) или vision-модель
+  (`--auto`);
+- описание вшивается меткой `<!-- fml:N -->` в чанк → находится FTS и
+  вектором вместе со своим пунктом; после этого чанк «без вектора» —
+  `reembed` → `СИНХРОНО` (проверять через `status`, не на глаз);
+- для агента все команды принимают `--json` (сторонний вывод вроде
+  RapidOCR уходит в stderr, stdout — чистый JSON).
+
+---
+
+## 11. Мини-шпаргалка
 
 ```bash
 cd /d/DEV/spT00db
@@ -222,5 +308,11 @@ PY="C:/Users/olegs/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe"
 "$PY" norms.py search 'запрос' -k 5                                     # hybrid-поиск
 "$PY" norms.py search 'запрос' --json -k 3                              # для агента
 "$PY" norms.py reembed                                                  # доделать после обрыва
+"$PY" norms.py figures --pending                              # картинки без описания
+"$PY" norms.py describe 1 --text '…'                          # описать картинку (агент)
+"$PY" norms.py figures --auto                                 # автоописание LLM
+"$PY" norms.py tables --show 4                                # ячейки таблицы с num
+"$PY" norms.py formulas --pending                             # формулы без описания
+"$PY" norms.py formulas --set 6 --text '…' --expr '…'         # описать формулу
 "$PY" -m pytest tests -q                                                # smoke-тесты
 ```
