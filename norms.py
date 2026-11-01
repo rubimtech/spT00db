@@ -391,6 +391,7 @@ def _formula_payload(row) -> dict:
         "path": row["path"],
         "anchor": row["anchor"] or "",
         "latex": row["latex"],
+        "latex_geom": row["latex_geom"],
         "expr": row["expr"],
         "params": row["params"],
         "description": row["description"],
@@ -405,11 +406,22 @@ def cmd_formulas(args: argparse.Namespace) -> int:
 
     store = Store(DB_PATH)
     store.init_schema()
-    payload = {"extracted": None, "set": None, "auto": None, "dropped": None, "formulas": []}
+    payload = {
+        "extracted": None, "set": None, "auto": None, "dropped": None,
+        "md": None, "formulas": [],
+    }
+
+    def patch_md(doc_code: str) -> int:
+        inserted = formulas_mod.patch_document_md(
+            store, doc_code, verbose=not args.json,
+        )
+        return int(inserted or 0)
+
     try:
         if args.extract:
             docs = [store.get_document(args.doc)] if args.doc else store.list_documents()
             total = 0
+            blocks = 0
             with _silenced(args.json):
                 for doc in docs:
                     if doc is None:
@@ -423,7 +435,9 @@ def cmd_formulas(args: argparse.Namespace) -> int:
                         store, doc["doc_id"], doc["pdf_path"], doc["code"],
                         verbose=not args.json,
                     )
+                    blocks += patch_md(doc["code"])
             payload["extracted"] = total
+            payload["md"] = blocks
 
         if args.set_id is not None:
             params = json.loads(args.params) if args.params else None
@@ -436,6 +450,7 @@ def cmd_formulas(args: argparse.Namespace) -> int:
                 "doc_code": row["doc_code"],
                 "chunk_id": chunk_id,
             }
+            payload["md"] = patch_md(row["doc_code"])
 
         if args.auto:
             cfg = load_vision_config()
@@ -450,7 +465,8 @@ def cmd_formulas(args: argparse.Namespace) -> int:
             if args.limit:
                 pending = pending[: int(args.limit)]
             done = 0
-            for row in pending:
+            touched: list[str] = []
+            for number, row in enumerate(pending, start=1):
                 try:
                     data = formulas_mod.describe_formula_with_llm(
                         row["path"], row["anchor"] or "", row["tag"], cfg,
@@ -463,16 +479,48 @@ def cmd_formulas(args: argparse.Namespace) -> int:
                     params=data["params"] or None, description=data["text"],
                     by=f"llm:{cfg.model}",
                 )
+                if row["doc_code"] not in touched:
+                    touched.append(row["doc_code"])
                 done += 1
+                if not args.json:
+                    # прогон долгий (десятки секунд на формулу) — видно, где он
+                    tag = f"({row['tag']})" if row["tag"] else "(без номера)"
+                    print(
+                        f"[fml] {number}/{len(pending)} id={row['formula_id']} {tag}",
+                        flush=True,
+                    )
+            blocks = sum(patch_md(code) for code in touched)
             payload["auto"] = done
+            payload["md"] = blocks if touched else payload["md"]
 
         if args.drop is not None:
-            if store.get_formula(args.drop) is None:
+            row = store.get_formula(args.drop)
+            if row is None:
                 print(f"формула id={args.drop} не найдена", file=sys.stderr)
                 return 1
             store.conn.execute("DELETE FROM formulas WHERE formula_id = ?", (args.drop,))
             store.commit()
             payload["dropped"] = args.drop
+            # удалённая ложная формула не должна остаться блоком в Markdown
+            payload["md"] = patch_md(row["doc_code"])
+
+        if args.md:
+            docs = [store.get_document(args.doc)] if args.doc else store.list_documents()
+            blocks = 0
+            with _silenced(args.json):
+                for doc in docs:
+                    if doc is None:
+                        print(f"документ {args.doc} не найден", file=sys.stderr)
+                        return 1
+                    inserted = formulas_mod.patch_document_md(
+                        store, doc["code"], verbose=not args.json,
+                    )
+                    if inserted is None:
+                        if not args.json:
+                            print(f"пропуск {doc['code']}: нет Markdown", file=sys.stderr)
+                        continue
+                    blocks += inserted
+            payload["md"] = blocks
 
         rows = store.list_formulas(args.doc, pending=True if args.pending else None)
         payload["formulas"] = [_formula_payload(row) for row in rows]
@@ -497,6 +545,8 @@ def cmd_formulas(args: argparse.Namespace) -> int:
             print(f"\nзаписано: id={payload['set']['formula_id']} в чанк {target or 'не найден'}")
             if target:
                 print("вектор чанка устарел — norms.py reembed, потом status (СИНХРОНО)")
+    if not args.json and payload["md"]:
+        print(f"формул в Markdown: {payload['md']} блоков")
     return 0
 
 
@@ -610,6 +660,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     formulas_p.add_argument("--limit", type=int, help="сколько pending описать в --auto")
     formulas_p.add_argument("--drop", type=int, metavar="ID", help="удалить ложную формулу")
+    formulas_p.add_argument(
+        "--md", action="store_true",
+        help="переписать Markdown документа: LaTeX/кроп формулы вместо потерянной строки",
+    )
     formulas_p.set_defaults(func=cmd_formulas)
 
     return parser

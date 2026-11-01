@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from conftest import CODE
 from norms_base.convert import pdf_to_markdown
-from norms_base.formulas import extract_formulas, sync_formulas
+from norms_base.formulas import extract_formulas, patch_document_md, patch_markdown, sync_formulas
 from norms_base.tables import extract_tables, parse_number
 
 # ------------------------------------------------------------------ числа
@@ -158,3 +158,93 @@ def test_formula_note_marks_vectors_stale_and_reembed_fixes(ingested):
     info = pipeline.status(store, ingested.vector_store)
     assert info["pending_embedding"] == 0, info
     assert info["sync_delta"] == 0, f"после reembed расхождение: {info}"
+
+
+# ------------------------------------------------------- формулы в Markdown
+
+
+def test_patch_markdown_puts_latex_before_tag(tmp_path):
+    md = "по формуле:\n\n(А.6)\n\nгде t — температура"
+    rows = [{
+        "formula_id": 7, "tag": "А.6", "path": str(tmp_path / "img" / "f.png"),
+        "latex": r"\rho = \frac{353}{273 + t_h}", "expr": "",
+        "description": "Плотность приточного воздуха",
+    }]
+    text, inserted = patch_markdown(md, rows, tmp_path)
+    assert inserted == 1
+    assert "$$" in text and r"\frac{353}{273 + t_h}" in text
+    assert "(А.6)" in text, "строка-номер потеряна — чанк-носитель её ищет"
+    assert text.index(r"\frac{353}") < text.index("(А.6)")
+
+    again, inserted2 = patch_markdown(text, rows, tmp_path)
+    assert inserted2 == 1 and again == text, "повторная вставка задублировала блок"
+
+
+def test_patch_markdown_without_recognition_keeps_crop_image(tmp_path):
+    img = tmp_path / "img" / "f_p003_01.png"
+    img.parent.mkdir(parents=True)
+    img.write_bytes(b"png")
+    rows = [{
+        "formula_id": 1, "tag": None, "path": str(img),
+        "latex": "", "expr": "", "description": "",
+    }]
+    text, inserted = patch_markdown("текст документа\n", rows, tmp_path)
+    assert inserted == 1
+    assert "![Формула без номера](img/f_p003_01.png)" in text
+    assert "## Формулы, извлечённые из PDF" in text
+
+
+def test_patch_markdown_places_by_anchor_when_tag_line_lost(tmp_path):
+    """Тело формулы и её номер потеряны конвертером — вставка идёт по якорю."""
+    md = (
+        "5.2 Нормируемое значение приведенного сопротивления теплопередаче\n"
+        "ограждающей конструкции следует определять по формуле\n"
+        "\n"
+        "где R — базовое значение требуемого сопротивления теплопередаче;\n"
+    )
+    img = tmp_path / "img" / "f_p011_01.png"
+    img.parent.mkdir(parents=True)
+    img.write_bytes(b"png")
+    rows = [{
+        "formula_id": 53, "tag": "5.2", "path": str(img),
+        "latex": "", "expr": "", "description": "",
+        "anchor": "5.2 Нормируемое значение приведенного сопротивления теплопередаче "
+                  "ограждающей конструкции следует определять по формуле",
+    }]
+    text, inserted = patch_markdown(md, rows, tmp_path)
+    assert inserted == 1
+    assert "f_p011_01.png" in text
+    assert text.index("f_p011_01.png") < text.index("где R — базовое")
+
+
+def test_patch_document_md_rewrites_saved_file(tmp_path):
+    from norms_base.storage import Store
+
+    store = Store(tmp_path / "t.db")
+    store.init_schema()
+    md = tmp_path / "doc.md"
+    md.write_text("по формуле:\n\n(А.6)\n", encoding="utf-8")
+    img = tmp_path / "img" / "f_p003_01.png"
+    img.parent.mkdir(parents=True)
+    img.write_bytes(b"png")
+    doc_id = store.upsert_document(code=CODE, title="Т", md_path=str(md))
+    store.upsert_formula(
+        doc_id=doc_id, tag="А.6", page=3, bbox="0,0,1,1", path=str(img), anchor="",
+    )
+    formula = next(r for r in store.list_formulas(CODE) if r["tag"] == "А.6")
+    store.set_formula_data(
+        formula["formula_id"], latex=r"\rho = \frac{353}{273 + t_h}",
+        description="Плотность приточного воздуха", by="test",
+    )
+    inserted = patch_document_md(store, CODE, verbose=False)
+    store.close()
+
+    assert inserted == 1
+    assert r"\frac{353}{273 + t_h}" in md.read_text(encoding="utf-8")
+
+
+def test_ingest_writes_formula_blocks_into_md(ingested):
+    """Даже без распознавания формула не теряется: в Markdown стоит кроп."""
+    md = ingested.result.md_path.read_text(encoding="utf-8")
+    assert "<!-- fml-md:А.6 -->" in md, "блок формулы не попал в Markdown при инжесте"
+    assert "f_p003_01.png" in md, "в блоке нет ссылки на кроп"

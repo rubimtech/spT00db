@@ -23,12 +23,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import config as _config  # IMG_DIR читаем динамически: тесты его патчат
+from .mathlayout import latex_from_region
 
 #: PUA-коды (MathType/SymbolMT) и математические операторы без единиц.
 PUA_RE = re.compile(r"[\ue000-\uf8ff]")
@@ -57,6 +59,7 @@ class FormulaCandidate:
     bbox: tuple[float, float, float, float]
     anchor: str                    #: ближайший текст сверху («…по формуле:»)
     path: Path                     # куда сохранён кроп
+    latex_geom: str = ""           #: LaTeX, восстановленный по геометрии символов
 
 
 def extract_formulas(
@@ -100,6 +103,7 @@ def extract_formulas(
                         bbox=(round(clip.x0, 1), round(clip.y0, 1), round(clip.x1, 1), round(clip.y1, 1)),
                         anchor=_anchor(lines, clip, doc_code),
                         path=path,
+                        latex_geom=latex_from_region(page, clip, region[4]),
                     )
                 )
     finally:
@@ -133,6 +137,7 @@ def sync_formulas(
             bbox=",".join(str(value) for value in item.bbox),
             path=str(item.path),
             anchor=item.anchor,
+            latex_geom=item.latex_geom,
         )
         paths.append(str(item.path))
     store.drop_missing_formulas(doc_id, keep=paths)
@@ -145,6 +150,292 @@ def sync_formulas(
             flush=True,
         )
     return len(candidates)
+
+
+# ---------------------------------------------------------------- markdown
+#: Маркеры блока формулы в Markdown: по ним блок снимается и ставится заново,
+#: поэтому повторная вставка идемпотентна (текст не дублируется).
+MD_OPEN = "<!-- fml-md:{key} -->"
+MD_CLOSE = "<!-- /fml-md:{key} -->"
+MD_EXTRA_OPEN = "<!-- fml-md-extra -->"
+MD_EXTRA_CLOSE = "<!-- /fml-md-extra -->"
+
+#: Прежние блоки (в том числе от прошлой индексации) — DOTALL, без жадности.
+_MD_BLOCK_RE = re.compile(
+    r"\n?<!-- fml-md:[^>\n]*-->\n.*?\n<!-- /fml-md:[^>\n]*-->\n?", re.S
+)
+_MD_EXTRA_RE = re.compile(
+    r"\n?<!-- fml-md-(?:extra|untagged) -->\n.*?"
+    r"\n<!-- /fml-md-(?:extra|untagged) -->\n?",
+    re.S,
+)
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def formula_markdown_block(row: Any, md_dir: Path | str | None = None) -> str:
+    """Тело блока формулы: LaTeX > вычисляемое выражение > кроп PNG + описание.
+
+    В Markdown норматив идёт вместо сплющенной строки PDF. Пока формула не
+    распознана, ставится ссылка на кроп — это честнее, чем потерять её.
+    """
+    latex = _field(row, "latex")
+    geom = "" if latex else _sane_geometry(_field(row, "latex_geom"))
+    expr = _field(row, "expr")
+    description = _field(row, "description")
+    tag = _field(row, "tag")
+    label = f"({tag})" if tag else "без номера"
+    lines: list[str] = []
+    if latex:
+        # распознано моделью/агентом — самый надёжный вариант
+        lines += ["$$", latex, "$$"]
+    elif geom:
+        # восстановлено по геометрии символов: структура верна, опечатки
+        # возможны, поэтому рядом остаётся кроп для сверки глазами
+        lines += ["$$", geom, "$$"]
+        href = _image_href(row, md_dir)
+        if href:
+            lines.append(f"![Формула {label} — сверка с PDF]({href})")
+    elif expr:
+        lines += ["```text", expr, "```"]
+    else:
+        href = _image_href(row, md_dir)
+        if not href:
+            return ""
+        lines.append(f"![Формула {label}]({href})")
+    if description:
+        lines.append(f"*{description}*")
+    return "\n".join(lines)
+
+
+def _sane_geometry(latex: str) -> str:
+    """Геометрический LaTeX без грубых дефектов; "" — показывать его нельзя.
+
+    Черновое восстановление не должно подменять картинку мусором. Признаки
+    брака: обрывки объяснений внутри ``\\text{…}`` (в СП это куски абзаца
+    «-ного помещения, определяемый…»), несбалансированные скобки, отсутствие
+    отношения или дроби, неразобранные глифы.
+    """
+    if len(latex) < 4 or len(latex) > 300:
+        return ""
+    if latex.count("{") != latex.count("}"):
+        return ""
+    if any(0xE000 <= ord(char) <= 0xF8FF for char in latex):
+        return ""
+    if not re.search(r"[=<>]|\\frac|\\le|\\ge|\\approx", latex):
+        return ""
+    if latex.startswith(("^", "_")):
+        return ""              # индекс без основания — строка разобрана не с начала
+    if re.search(r"[=<>]\s*[\^_]", latex):
+        return ""              # правая часть отношения потеряна
+    if re.search(r"(?:^|[^\d]),\d", latex):
+        return ""              # «,075» — ведущая цифра потеряна
+    if re.search(r"[ÂâÎîÁáÃÑÏòî]", latex):
+        return ""              # битая кодировка шрифта (кириллица как Latin-1)
+    for chunk in re.findall(r"\\text\{([^{}]*)\}", latex):
+        if len(chunk) > 6:      # индекс короткий, фраза — нет
+            return ""
+    return latex
+
+
+def patch_markdown(
+    text: str, formulas: Sequence[Any], md_dir: Path | str | None = None
+) -> tuple[str, int]:
+    """Вставляет блоки формул в Markdown, не теряя ни одной формулы.
+
+    Порядок привязки — от точной к грубой:
+
+    1. строка-номер отдельной строкой (``(А.6)``) — блок ставится над ней;
+       строка остаётся на месте: по ней формулу находит чанк-носитель
+       (``store._formula_chunk``);
+    2. якорный текст над формулой («…определяется по формуле») — блок после
+       этой строки: так формула встаёт туда, где PDF потерял её тело;
+    3. номер внутри строки («…, (Б.1)») — блок после неё;
+    4. ни одного признака — раздел в конце документа, чтобы не потерять.
+
+    Идемпотентно: прежние блоки и раздел снимаются по маркерам и ставятся
+    заново, повторный вызов даёт тот же текст. Возвращает
+    ``(новый текст, сколько блоков вставлено)``.
+    """
+    text = _MD_EXTRA_RE.sub("\n", text)
+    text = _MD_BLOCK_RE.sub("\n", text)
+    # снятие блока оставляет лишнюю пустую строку — схлопываем её, иначе
+    # повторная вставка каждый раз добавляла бы ещё одну
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines = text.split("\n")
+
+    pending: list[dict[str, str]] = []
+    for row in formulas:
+        block = _md_block(row, md_dir)
+        if block:
+            pending.append({
+                "tag": _field(row, "tag"),
+                "block": block,
+                "anchor": _field(row, "anchor"),
+            })
+
+    before: dict[int, list[str]] = {}
+    after: dict[int, list[str]] = {}
+    extra: list[str] = []
+
+    # 1) номер формулы — отдельная строка
+    for item in list(pending):
+        needle = f"({item['tag']})" if item["tag"] else ""
+        if not needle:
+            continue
+        for index, line in enumerate(lines):
+            if line.strip() == needle:
+                before.setdefault(index, []).append(item["block"])
+                pending.remove(item)
+                break
+
+    # 2) якорный текст над формулой
+    for item in list(pending):
+        index = _anchor_index(lines, item["anchor"])
+        if index is not None:
+            after.setdefault(index, []).append(item["block"])
+            pending.remove(item)
+
+    # 3) номер внутри строки — сплющенная формула осталась в ней
+    for item in list(pending):
+        needle = f"({item['tag']})" if item["tag"] else ""
+        if not needle:
+            continue
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("|"):
+                continue
+            if needle in line:
+                after.setdefault(index, []).append(item["block"])
+                pending.remove(item)
+                break
+
+    # 4) привязать не к чему — раздел в конце документа
+    for item in pending:
+        extra.append(item["block"])
+        if item["tag"]:
+            extra.extend([f"({item['tag']})", ""])
+
+    inserted = sum(len(blocks) for blocks in before.values())
+    inserted += sum(len(blocks) for blocks in after.values())
+    inserted += sum(1 for item in pending)
+
+    out: list[str] = []
+    for index, line in enumerate(lines):
+        for block in before.get(index, []):
+            out.extend([block, ""])
+        out.append(line)
+        for block in after.get(index, []):
+            out.extend(["", block])
+    text = "\n".join(out)
+
+    if extra:
+        appendix = [MD_EXTRA_OPEN, "## Формулы, извлечённые из PDF", ""]
+        appendix += extra
+        appendix.append(MD_EXTRA_CLOSE)
+        text = text.rstrip() + "\n\n" + "\n".join(appendix) + "\n"
+    return text, inserted
+
+
+def patch_document_md(
+    store: Any,
+    doc_code: str,
+    md_dir: Path | str | None = None,
+    *,
+    verbose: bool = True,
+) -> int | None:
+    """Переписывает сохранённый Markdown документа блоками формул.
+
+    ``None`` — файла нет (артефакт удалён), ``int`` — сколько блоков вставлено.
+    """
+    doc = store.get_document(doc_code)
+    if doc is None or not doc["md_path"]:
+        return None
+    md_path = Path(doc["md_path"])
+    if not md_path.exists():
+        return None
+    original = md_path.read_text(encoding="utf-8")
+    patched, inserted = patch_markdown(
+        original, store.list_formulas(doc_code), md_dir or md_path.parent
+    )
+    if patched != original:
+        md_path.write_text(patched, encoding="utf-8")
+    if verbose:
+        print(f"[fml] {inserted} блоков формул -> {md_path.name}", flush=True)
+    return inserted
+
+
+def _md_block(row: Any, md_dir: Path | str | None) -> str:
+    body = formula_markdown_block(row, md_dir)
+    if not body:
+        return ""
+    key = _field(row, "tag") or f"id{_field(row, 'formula_id')}"
+    return f"{MD_OPEN.format(key=key)}\n{body}\n{MD_CLOSE.format(key=key)}"
+
+
+def _field(row: Any, name: str) -> str:
+    """Значение поля строки sqlite3.Row/dict строкой (нет поля — пусто)."""
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return ""
+    return "" if value is None else str(value).strip()
+
+
+def _image_href(row: Any, md_dir: Path | str | None) -> str:
+    """Путь кропа относительно каталога Markdown (posix-разделители)."""
+    raw = _field(row, "path")
+    if not raw:
+        return ""
+    path = Path(raw)
+    if md_dir:
+        try:
+            return Path(os.path.relpath(path, Path(md_dir))).as_posix()
+        except ValueError:  # разные диски Windows — оставляем абсолютный путь
+            pass
+    return path.as_posix()
+
+
+def _match_key(value: str) -> str:
+    """Текст для сравнения якоря с Markdown: без тегов, разметки и лишних пробелов."""
+    text = _HTML_TAG.sub(" ", value or "")
+    text = text.replace("*", " ").replace("_", " ").replace("\\", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _anchor_index(lines: Sequence[str], anchor: str) -> int | None:
+    """Строка Markdown, в которой узнаётся якорный текст над формулой.
+
+    Якорь склеен из строк PDF («ближайшая» + строка над ней), а Markdown
+    переносит текст иначе, поэтому пробуем несколько окон: сначала начало
+    (ближайшая строка), затем конец («…по формуле»).
+    """
+    needle = _match_key(anchor)
+    if len(needle) < 25:
+        return None
+    keys = [_match_key(line) for line in lines]
+
+    def hits(probe: str) -> list[int]:
+        # строки таблиц — это оглавление и перечни: якорь там встречается
+        # раньше самого раздела, и формула уехала бы в содержание
+        return [
+            index
+            for index, key in enumerate(keys)
+            if not lines[index].lstrip().startswith("|") and probe in key
+        ]
+
+    # начало якоря — это строка прямо над формулой: сначала самое длинное окно
+    for size in (120, 90, 60):
+        if len(needle) <= size:
+            continue
+        found = hits(needle[:size])
+        if found:
+            return found[0]
+    # конец якоря («…определяется по формуле») — фраза нередко встречается
+    # в разных местах, поэтому берём только однозначное совпадение
+    tail = needle[-40:] if len(needle) > 40 else needle
+    found = hits(tail) if len(tail) >= 25 else []
+    if len(found) == 1:
+        return found[0]
+    return None
 
 
 # ------------------------------------------------------------------ vision

@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS formulas (
     path         TEXT NOT NULL,
     anchor       TEXT,                  -- якорный текст документа («…по формуле:»)
     latex        TEXT,
+    latex_geom   TEXT,                  -- LaTeX из геометрии символов (черновик, без LLM)
     expr         TEXT,                  -- вычисляемое выражение для скриптов
     params       TEXT,                  -- JSON: символ -> расшифровка/единицы
     description  TEXT,                  -- проза для поиска (источник правды)
@@ -149,6 +150,16 @@ CREATE INDEX IF NOT EXISTS idx_formulas_doc ON formulas(doc_id);
 """
 
 _TOKEN = re.compile(r"\w+", re.UNICODE)
+
+
+def _like_escape(value: str) -> str:
+    r"""Экранирует спецсимволы LIKE (``%``, ``_``, ``\``) с ``ESCAPE '\'``.
+
+    Коды документов пунктуацию содержат («СП 60.13330.2020»), но ``_`` и ``%``
+    встречаются в кодах редко — экранируем всё, чтобы шаблон подмешивания
+    правок не ловил лишние документы.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _unique(items: Iterable[Any]) -> list[str]:
@@ -306,7 +317,25 @@ class Store:
 
     def init_schema(self) -> None:
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    #: Колонки, добавленные после первой версии схемы: ``ALTER TABLE`` их не
+    #: создаст у существующей базы, а ``CREATE TABLE IF NOT EXISTS`` — тем более.
+    MIGRATIONS = (
+        ("formulas", "latex_geom", "TEXT"),
+    )
+
+    def _migrate(self) -> None:
+        for table, column, sql_type in self.MIGRATIONS:
+            existing = {
+                row["name"]
+                for row in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+                )
 
     # -------------------------------------------------------------- documents
 
@@ -695,11 +724,11 @@ class Store:
             return int(cursor.lastrowid)
         formula_id = int(row["formula_id"])
         conn.execute(
-            "UPDATE formulas SET tag = ?, page = ?, bbox = ?, anchor = ?"
-            " WHERE formula_id = ?",
+            "UPDATE formulas SET tag = ?, page = ?, bbox = ?, anchor = ?,"
+            " latex_geom = ? WHERE formula_id = ?",
             (
                 fields.get("tag"), fields.get("page"), fields.get("bbox"),
-                fields.get("anchor"), formula_id,
+                fields.get("anchor"), fields.get("latex_geom"), formula_id,
             ),
         )
         conn.commit()
@@ -905,25 +934,41 @@ class Store:
         Ищет по ``chunk_clauses``, а не по ``chunks.clause_id``: склейка мелких
         пунктов оставляет в чанке только номер первого, поэтому пункт 7.6.9
         может лежать в чанке с primary-номером 7.6.8.
+
+        К базовому коду подмешиваются документы-правки того же свода — коды вида
+        ``'СП 60.13330.2020 (изм. 4)'``: точная ссылка обязана отдавать
+        актуальную редакцию, а не только исходный текст. Правки идут после
+        базового документа (основной код — префикс, сортировка по коду сохраняет
+        порядок «сначала оригинал, затем изменения»).
         """
+        pattern = _like_escape(doc_code) + " (%"
         sql = f"""
             SELECT {SELECT_COLUMNS}
             FROM chunk_clauses cc
             JOIN chunks c ON c.chunk_id = cc.chunk_id
             JOIN documents d ON d.doc_id = c.doc_id
-            WHERE d.code = ? AND cc.clause_id = ?
-            ORDER BY c.ord LIMIT ?
+            WHERE cc.clause_id = ?
+              AND (d.code = ? OR d.code LIKE ? ESCAPE '\\')
+            ORDER BY d.code, c.ord LIMIT ?
         """
-        return [ChunkRow.from_row(row) for row in self.conn.execute(sql, (doc_code, clause_id, limit))]
+        return [
+            ChunkRow.from_row(row)
+            for row in self.conn.execute(sql, (clause_id, doc_code, pattern, limit))
+        ]
 
     def find_section(self, doc_code: str, section: str, *, limit: int = 50) -> list[ChunkRow]:
         sql = f"""
             SELECT {SELECT_COLUMNS}
             FROM chunks c JOIN documents d ON d.doc_id = c.doc_id
-            WHERE d.code = ? AND c.section = ?
-            ORDER BY c.ord LIMIT ?
+            WHERE c.section = ?
+              AND (d.code = ? OR d.code LIKE ? ESCAPE '\\')
+            ORDER BY d.code, c.ord LIMIT ?
         """
-        return [ChunkRow.from_row(row) for row in self.conn.execute(sql, (doc_code, section, limit))]
+        pattern = _like_escape(doc_code) + " (%"
+        return [
+            ChunkRow.from_row(row)
+            for row in self.conn.execute(sql, (section, doc_code, pattern, limit))
+        ]
 
     def get_chunks_by_ids(self, chunk_ids: Iterable[int]) -> dict[int, ChunkRow]:
         ids = list(chunk_ids)

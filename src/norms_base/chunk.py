@@ -29,6 +29,19 @@ RE_CLAUSE = re.compile(r"^(\d{1,2}(?:\.\d{1,2}){0,2})\.?\s+\S")
 RE_CLAUSE_ANY = re.compile(
     r"^((?:\d{1,2}(?:\.\d{1,2}){0,2})|(?:[А-П]\.\d{1,2}(?:\.\d{1,2})*))\.?\s+\S"
 )
+#: Пункт, набранный словом (официальные изменения: «Пункт 6.2.17. Изложить…»).
+#: Без этой формы чанки изменений не привязываются к номерам пунктов основного
+#: документа — точный запрос clause() их не находит.
+RE_PT_CLAUSE = re.compile(
+    r"^\*{0,2}Пункт[ы]?\s+"
+    r"((?:\d{1,2}(?:\.\d{1,2}){0,2})|(?:[А-П]\.\d{1,2}(?:\.\d{1,2})*))\.?\*{0,2}\.?\s+\S"
+)
+#: То же без привязки к началу строки: в изменениях соседние пункты склеиваются
+#: конвертером в одну строку («…подготовка». Пункт 5.8. Четвёртый абзац…») —
+#: номер обязан попасть в chunk_clauses, даже если границей чанка он не стал.
+RE_PT_INLINE = re.compile(
+    r"Пункт[ы]?\s+((?:\d{1,2}(?:\.\d{1,2}){0,2})|(?:[А-П]\.\d{1,2}(?:\.\d{1,2})*))"
+)
 RE_TABLE = re.compile(r"^\|")
 RE_TABLE_SEP = re.compile(r"^\|(\s*:?-+:?\s*\|)+\s*$")
 RE_SENTENCE = re.compile(r"(?<=[.!?;])\s+")
@@ -179,7 +192,7 @@ def _split_blocks(text: str, min_chars: int, max_chars: int) -> list[_Block]:
             current.end = offset
             continue
 
-        clause_match = RE_CLAUSE_ANY.match(stripped)
+        clause_match = RE_CLAUSE_ANY.match(stripped) or RE_PT_CLAUSE.match(stripped)
         starts_clause = clause_match is not None
         clause_id = clause_match.group(1) if clause_match else None
         if starts_clause:
@@ -211,9 +224,14 @@ def _attach_clauses(blocks: Sequence[_Block]) -> list[_Block]:
     for block in blocks:
         found: list[str] = []
         for line in block.lines:
-            match = RE_CLAUSE_ANY.match(line.strip())
+            stripped = line.strip()
+            match = RE_CLAUSE_ANY.match(stripped)
             if match and match.group(1) not in found:
                 found.append(match.group(1))
+            # «Пункт N.N» — начало строки или середина (склейка конвертером)
+            for inline in RE_PT_INLINE.finditer(stripped):
+                if inline.group(1) not in found:
+                    found.append(inline.group(1))
         if found:
             block.clauses = tuple(found)
             block.clause_id = found[0]

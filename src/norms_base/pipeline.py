@@ -26,7 +26,7 @@ from .convert import pdf_to_markdown
 from .download import fetch_pdf
 from .embed import Embedder
 from .figures import sync_figures
-from .formulas import sync_formulas
+from .formulas import patch_markdown, sync_formulas
 from .storage import Store, parse_clause_ids
 from .tables import sync_tables
 from .vectorstore import VectorStore, point_id_for
@@ -87,6 +87,10 @@ def add_document(
             print(f"[pdf] {fetched_path.name} | {fetched.size} байт | sha256 {sha[:16]}", flush=True)
 
     # 2. Markdown
+    # Блоки формул вставляются ПОСЛЕ чанкинга (шаг 4d): вставка сдвигает
+    # смещения, а карта страниц (doc.spans) осталась бы от исходного текста —
+    # номера страниц у чанков разъехались бы.
+    existed = store.get_document(code) is not None
     doc = pdf_to_markdown(fetched_path, code)
     md_path = MD_DIR / f"{_slug(code)}.md"
     md_path.write_text(doc.text, encoding="utf-8")
@@ -123,7 +127,6 @@ def add_document(
         )
 
     # 4. SQLite
-    existed = store.get_document(code) is not None
     doc_id = store.upsert_document(
         code=code,
         title=title,
@@ -148,6 +151,17 @@ def add_document(
     # расчётно-проверочные скрипты берут значения отсюда, а не из текста чанка
     table_count = sync_tables(store, doc_id, code, doc.text, doc.page_for, verbose=verbose)
     formula_count = sync_formulas(store, doc_id, fetched_path, code, verbose=verbose)
+
+    # 4d. Формулы в Markdown: LaTeX (или кроп, пока не распознана) вместо
+    # сплющенной строки PDF. Чанки уже нарезаны — блоки в них не попадают,
+    # поиск формулы идёт меткой <!-- fml:N -->; Markdown — читаемый артефакт.
+    md_text = md_path.read_text(encoding="utf-8")
+    patched, blocks = patch_markdown(md_text, store.list_formulas(code), MD_DIR)
+    if patched != md_text:
+        md_path.write_text(patched, encoding="utf-8")
+        store.upsert_document(code=code, chars=len(patched))
+    if verbose and blocks:
+        print(f"[md] {blocks} блоков формул -> {md_path.name}", flush=True)
 
     # 5. Векторы: старые точки документа убираем, новые эмбедим и грузим
     if not vector_store.available():

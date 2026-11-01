@@ -26,6 +26,13 @@ EDITION_TAIL = re.compile(r"^\(?(?:проект[^()]{0,40}редакция|из�
 
 #: Номер страницы: арабские (109 стр.) и римские фронтисписа (II…VI).
 PAGE_NUMBER = re.compile(r"^(\d{1,3}|I{1,3}|IV|V|VI)$")
+#: Чистая дата-колонтитул (шапки aeropro.wiki: «01.11.2024», «21.07.2026»).
+PURE_DATE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+#: Шапка-колонтитул официальных изменений: «Изм. 3 к СП 60.13330.2020»,
+#: «6 Изменение к СП 60.13330.2020 …». Настоящий титул изменения конвертируется
+#: в Markdown-заголовок («# **ИЗМЕНЕНИЕ № 6**»), поэтому такой фильтр на краю
+#: страницы его не задевает.
+AMEND_HEADER = re.compile(r"^(?:Изм\.\s*\d+|\d+\s+Изменение)\s+к\s+\S")
 
 #: Тег pymupdf4llm (``<u>``, ``<br/>``, ``<sup>``): снимаются до сравнения строк,
 #: иначе колонтитул «**(проект 2 редакция)** в тегах» не узнаётся.
@@ -130,8 +137,9 @@ def _fallback_pymupdf(pdf_path: Path | str, doc_code: str) -> DocMarkdown:
 def clean_page(text: str, doc_code: str) -> str:
     """Убирает колонтитулы, номера страниц и мусор одной страницы."""
     lines = text.split("\n")
+    # край страницы: шапка aeropro занимает три строки (дата, «Изм. N к …», номер)
     non_empty = [index for index, line in enumerate(lines) if line.strip()]
-    edge = set(non_empty[:2]) | set(non_empty[-2:])
+    edge = set(non_empty[:3]) | set(non_empty[-2:])
 
     kept: list[str] = []
     skip_next = False
@@ -144,6 +152,9 @@ def clean_page(text: str, doc_code: str) -> str:
             kept.append("")
             continue
         if _is_header_like(stripped, doc_code):
+            continue
+        # шапки официальных изменений: дата и «Изм. N к СП …» — только колонтитул
+        if PURE_DATE.match(stripped) or AMEND_HEADER.match(stripped):
             continue
         if index in edge and PAGE_NUMBER.match(stripped):
             continue

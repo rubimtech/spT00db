@@ -275,8 +275,28 @@ sync_delta: 0
                          --expr '353/(273+t_h)' --params '{"t_h": "t наружного, °С"}'
 "$PY" norms.py formulas --auto              # то же vision-моделью (figures.yaml)
 "$PY" norms.py formulas --drop 12            # удалить ложную формулу
+"$PY" norms.py formulas --md                 # переписать Markdown блоками формул
 "$PY" norms.py reembed                      # ОБЯЗАТЕЛЬНО после описания
 ```
+
+### Распознавание пачкой суб-агентами
+
+`formulas --auto` шлёт кропы во внешнюю vision-модель по одному — медленно и
+дорого на десятки формул. Второй путь: раздать кропы суб-агентам, каждый
+смотрит картинку сам (`read` на PNG) и возвращает JSON. Импорт и запись в
+базу делает координатор — параллельные писатели в SQLite не нужны.
+
+```bash
+"$PY" tools/formula_work.py split --parts 6   # data/formula_work/part_N.json
+# ...суб-агенты читают part_N.json, пишут part_N.out.json по BRIEF.md...
+"$PY" tools/formula_work.py import            # в базу: latex/expr/params/text
+"$PY" norms.py formulas --md                  # LaTeX в Markdown
+"$PY" norms.py reembed                        # метки вшиты в чанки
+```
+
+Формат пакета и требования к распознаванию — `data/formula_work/BRIEF.md`
+(он же инструкция для агента). `drop: true` в ответе удаляет ложную запись
+(заголовок таблицы, обрывок абзаца). `import` пишет `described_by=agent:subagent`.
 
 Как это работает:
 
@@ -287,9 +307,25 @@ sync_delta: 0
   и PNG-кроп в `data/img/<код>/f_pNNN_KK.png`; распознавание (`latex`,
   `expr`, `params`, `description`) заполняет агент (`--set`) или vision-модель
   (`--auto`);
+- **`latex_geom`** — LaTeX, восстановленный при извлечении по геометрии
+  символов (`mathlayout.py`): черта дроби из `get_drawings`, степени и индексы
+  по кеглю и смещению базовой линии, глифы SymbolMT по таблице соответствий.
+  Это черновик без LLM: он есть у всех формул, но в Markdown попадает только
+  после проверки качества (`_sane_geometry`: сбалансированные скобки, нет
+  обрывков объяснений и битой кодировки, нет потерянных цифр). Не прошёл —
+  в Markdown остаётся кроп, а `latex_geom` можно посмотреть в `--json`
+  и поправить руками через `--set --latex`;
 - описание вшивается меткой `<!-- fml:N -->` в чанк → находится FTS и
   вектором вместе со своим пунктом; после этого чанк «без вектора» —
   `reembed` → `СИНХРОНО` (проверять через `status`, не на глаз);
+- **Markdown тоже несёт формулы**: `add` и `--md` ставят в `data/md/<код>.md`
+  блок `<!-- fml-md:А.6 --> … <!-- /fml-md:А.6 -->`. Внутри — LaTeX в `$$…$$`
+  в порядке приоритета: `latex` (модель/агент) → `latex_geom` (геометрия,
+  рядом остаётся кроп для сверки) → выражение `expr` → ссылка на кроп PNG.
+  Блок встаёт над строкой-номером, а если номер конвертер потерял — по якорному
+  тексту («…по формуле»); ни к чему не привязанные формулы уходят в раздел
+  «Формулы, извлечённые из PDF» в конце. Вставка идемпотентна: повторный
+  `--md` даёт тот же файл;
 - для агента все команды принимают `--json` (сторонний вывод вроде
   RapidOCR уходит в stderr, stdout — чистый JSON).
 
@@ -314,5 +350,7 @@ PY="C:/Users/olegs/AppData/Local/hermes/hermes-agent/venv/Scripts/python.exe"
 "$PY" norms.py tables --show 4                                # ячейки таблицы с num
 "$PY" norms.py formulas --pending                             # формулы без описания
 "$PY" norms.py formulas --set 6 --text '…' --expr '…'         # описать формулу
+"$PY" norms.py formulas --md                                  # формулы в Markdown
+"$PY" tools/formula_work.py split --parts 6 && … import       # пачкой суб-агентами
 "$PY" -m pytest tests -q                                                # smoke-тесты
 ```
